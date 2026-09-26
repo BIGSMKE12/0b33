@@ -89,10 +89,10 @@ pub fn do_set_metadata_signed(
     // resolve.
     let sub = get_subscription(env, payload.subscription_id)?;
 
-    // Validate key/value lengths before building the message — avoids
+    // Validate key/value lengths and key quota before building the message — avoids
     // panicking in build_metadata_signed_message if the payload is
-    // over-length, and returns a clean error instead.
-    apply_metadata_value(env, payload.subscription_id, &payload.key, &payload.value)?;
+    // over-length or over-capacity, and returns a clean error without mutating storage.
+    validate_metadata_input(env, payload.subscription_id, &payload.key, &payload.value)?;
 
     // Build the canonical message and verify the ed25519 signature against
     // the supplied pubkey. Verification hashes the message internally per
@@ -124,10 +124,10 @@ pub fn do_set_metadata_signed(
         return Err(Error::Forbidden);
     }
 
-    // Reject stale payloads. Strict inequality (`> =`) means an exactly-
+    // Reject stale payloads. Strict inequality (`>=`) means an exactly-
     // expired payload is rejected deterministically without an off-by-one
     // hazard. A generously future-dated `expires_at` (e.g. now + one
-    // interval) is the recommeded setting.
+    // interval) is the recommended setting.
     let now = env.ledger().timestamp();
     if now >= payload.expires_at {
         return Err(Error::InvalidInput);
@@ -142,6 +142,9 @@ pub fn do_set_metadata_signed(
         crate::nonce::DOMAIN_METADATA_SIGNED,
         payload.nonce,
     )?;
+
+    // Commit storage update only after all authentication, expiration, and nonce checks pass.
+    apply_metadata_storage(env, payload.subscription_id, &payload.key, &payload.value);
 
     env.events().publish(
         (
@@ -242,15 +245,11 @@ pub fn build_metadata_signed_message(
     buf
 }
 
-/// Shared inner helper for the on-chain and signed entrypoints.
+/// Validate metadata key, value, and key quota without modifying contract storage.
 ///
-/// Both [`set_metadata`] (after auth) and [`do_set_metadata_signed`] (after
-/// signature + nonce checks) end up here: validate key/value lengths, ensure
-/// the per-subscription key cap, write the storage entry, and return.
-///
-/// Split out so the validation/storage/error contract is identical and any
-/// future invariant change touches one place.
-fn apply_metadata_value(
+/// Ensures key and value length constraints, UTF-8 validity, and that adding
+/// a new key will not exceed [`MAX_METADATA_KEYS`].
+pub fn validate_metadata_input(
     env: &Env,
     subscription_id: u32,
     key: &String,
@@ -270,6 +269,31 @@ fn apply_metadata_value(
     validate_utf8_string(key, "metadata key")?;
     validate_utf8_string(value, "metadata value")?;
 
+    let keys: Vec<String> = env
+        .storage()
+        .persistent()
+        .get(&DataKey::MetadataKeys(subscription_id))
+        .unwrap_or(Vec::new(env));
+
+    let key_exists = keys.iter().any(|k| k == *key);
+
+    if !key_exists && keys.len() >= MAX_METADATA_KEYS {
+        return Err(Error::MetadataKeyLimitReached);
+    }
+
+    Ok(())
+}
+
+/// Commit metadata key and value into persistent storage.
+///
+/// Assumes [`validate_metadata_input`] has already validated lengths, UTF-8,
+/// and key quota.
+pub fn apply_metadata_storage(
+    env: &Env,
+    subscription_id: u32,
+    key: &String,
+    value: &String,
+) {
     let mut keys: Vec<String> = env
         .storage()
         .persistent()
@@ -279,9 +303,6 @@ fn apply_metadata_value(
     let key_exists = keys.iter().any(|k| k == *key);
 
     if !key_exists {
-        if keys.len() >= MAX_METADATA_KEYS {
-            return Err(Error::MetadataKeyLimitReached);
-        }
         keys.push_back(key.clone());
         env.storage()
             .persistent()
@@ -291,7 +312,19 @@ fn apply_metadata_value(
     env.storage()
         .persistent()
         .set(&DataKey::Metadata(subscription_id, key.clone()), value);
+}
 
+/// Shared inner helper for the on-chain entrypoint.
+///
+/// Validates key/value lengths and key quota, writes the storage entry, and returns.
+pub fn apply_metadata_value(
+    env: &Env,
+    subscription_id: u32,
+    key: &String,
+    value: &String,
+) -> Result<(), Error> {
+    validate_metadata_input(env, subscription_id, key, value)?;
+    apply_metadata_storage(env, subscription_id, key, value);
     Ok(())
 }
 
@@ -600,5 +633,101 @@ mod signed_message_tests {
     fn smoke_helper_module_compiles() {
         let env = Env::default();
         let _ = env;
+    }
+}
+
+#[cfg(test)]
+mod metadata_limit_ordering_tests {
+    use super::*;
+    use soroban_sdk::{Env, String, Vec};
+    use crate::types::DataKey;
+
+    #[test]
+    fn metadata_key_limit_checked_before_storage_mutation() {
+        let env = Env::default();
+        let sub_id = 42u32;
+
+        // Pre-fill MAX_METADATA_KEYS into storage
+        let mut keys = Vec::new(&env);
+        for n in 0..MAX_METADATA_KEYS {
+            let k = String::from_str(&env, &format!("key_{}", n));
+            let v = String::from_str(&env, &format!("val_{}", n));
+            keys.push_back(k.clone());
+            env.storage()
+                .persistent()
+                .set(&DataKey::Metadata(sub_id, k), &v);
+        }
+        env.storage()
+            .persistent()
+            .set(&DataKey::MetadataKeys(sub_id), &keys);
+
+        // Attempt to validate/insert an 11th distinct key
+        let new_key = String::from_str(&env, "key_overflow");
+        let new_val = String::from_str(&env, "val_overflow");
+
+        let res = apply_metadata_value(&env, sub_id, &new_key, &new_val);
+        assert_eq!(res, Err(Error::MetadataKeyLimitReached));
+
+        // Storage MUST be completely unchanged:
+        // 1. New key must not exist in MetadataKeys list
+        let stored_keys: Vec<String> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::MetadataKeys(sub_id))
+            .unwrap();
+        assert_eq!(stored_keys.len(), MAX_METADATA_KEYS);
+        assert!(!stored_keys.iter().any(|k| k == new_key));
+
+        // 2. New key must not exist in DataKey::Metadata
+        let stored_val: Option<String> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Metadata(sub_id, new_key.clone()));
+        assert_eq!(stored_val, None);
+
+        // 3. All original keys and values remain intact
+        for n in 0..MAX_METADATA_KEYS {
+            let k = String::from_str(&env, &format!("key_{}", n));
+            let expected_v = String::from_str(&env, &format!("val_{}", n));
+            let actual_v: String = env
+                .storage()
+                .persistent()
+                .get(&DataKey::Metadata(sub_id, k))
+                .unwrap();
+            assert_eq!(actual_v, expected_v);
+        }
+    }
+
+    #[test]
+    fn metadata_update_existing_key_at_limit_does_not_fail() {
+        let env = Env::default();
+        let sub_id = 42u32;
+
+        let mut keys = Vec::new(&env);
+        for n in 0..MAX_METADATA_KEYS {
+            let k = String::from_str(&env, &format!("key_{}", n));
+            let v = String::from_str(&env, "old");
+            keys.push_back(k.clone());
+            env.storage()
+                .persistent()
+                .set(&DataKey::Metadata(sub_id, k), &v);
+        }
+        env.storage()
+            .persistent()
+            .set(&DataKey::MetadataKeys(sub_id), &keys);
+
+        // Updating an existing key at capacity must succeed and update storage
+        let key_0 = String::from_str(&env, "key_0");
+        let new_val = String::from_str(&env, "new_val");
+
+        let res = apply_metadata_value(&env, sub_id, &key_0, &new_val);
+        assert!(res.is_ok());
+
+        let actual_v: String = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Metadata(sub_id, key_0))
+            .unwrap();
+        assert_eq!(actual_v, new_val);
     }
 }

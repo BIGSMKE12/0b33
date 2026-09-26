@@ -141,6 +141,7 @@ REMEDIATION: dict[str, tuple[str, str, bool]] = {
     "MerchantNotApproved":            ("Request admin approval or disable whitelist mode via set_merchant_whitelist_mode.", "—", False),
     "UnknownMerchantTag":             ("Fix input; call get_tag_allowlist and use only listed tags.", "—", False),
     "DuplicateMerchantTag":           ("Remove the repeated tag from the request and retry.", "—", False),
+    "MerchantTagLimitExceeded":       ("Reduce tags to at most MAX_MERCHANT_TAGS before retrying.", "—", False),
     # Token
     "InvalidTokenDecimals":           ("Fix token_decimals; must be in [1, 19].", "—", False),
     "InvalidToken":                   ("Provide an accepted token address from list_accepted_tokens.", "—", False),
