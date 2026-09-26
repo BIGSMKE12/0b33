@@ -1,7 +1,7 @@
 #![cfg(test)]
 
 use crate::{
-    queries::{MAX_SCAN_DEPTH, MAX_SUBSCRIPTION_LIST_PAGE},
+    queries::{MAX_QUERY_RESULTS, MAX_SCAN_DEPTH, MAX_SUBSCRIPTION_LIST_PAGE},
     subscription::MAX_WRITE_PATH_SCAN_DEPTH,
     types::{Subscription, SubscriptionStatus},
     SubscriptionVault, SubscriptionVaultClient,
@@ -263,17 +263,42 @@ fn test_subscriber_list_empty() {
 }
 
 #[test]
-#[should_panic(expected = "Error(Contract, #3001)")] // InvalidInput = 3001
+#[should_panic(expected = "Error(Contract, #6004)")] // InvalidExportLimit = 6004
 fn test_subscriber_list_invalid_limit_zero() {
     let (env, client, _token, _) = setup();
     client.list_subscriptions_by_subscriber(&Address::generate(&env), &0, &0);
 }
 
 #[test]
-#[should_panic(expected = "Error(Contract, #3001)")] // InvalidInput = 3001
+#[should_panic(expected = "Error(Contract, #6004)")] // InvalidExportLimit = 6004
 fn test_subscriber_list_invalid_limit_overflow() {
     let (env, client, _token, _) = setup();
-    client.list_subscriptions_by_subscriber(&Address::generate(&env), &0, &(MAX_SUBSCRIPTION_LIST_PAGE + 1));
+    client.list_subscriptions_by_subscriber(&Address::generate(&env), &0, &(MAX_QUERY_RESULTS + 1));
+}
+
+/// Verifies the hard cap: exactly MAX_QUERY_RESULTS is accepted; one over
+/// returns InvalidExportLimit (6004), not a generic input error.
+#[test]
+fn test_subscriber_list_max_query_results_cap_exact() {
+    let (env, client, token, _) = setup();
+    let subscriber = Address::generate(&env);
+    inject_subscriptions(&env, &client.address, MAX_QUERY_RESULTS, &subscriber, &token);
+
+    // Exactly at cap: must succeed
+    let page = client.list_subscriptions_by_subscriber(&subscriber, &0, &MAX_QUERY_RESULTS);
+    assert_eq!(page.subscription_ids.len(), MAX_QUERY_RESULTS);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #6004)")] // InvalidExportLimit = 6004
+fn test_subscriber_list_max_query_results_cap_exceeded() {
+    let (env, client, _token, _) = setup();
+    // limit = MAX_QUERY_RESULTS + 1 must be rejected with InvalidExportLimit
+    client.list_subscriptions_by_subscriber(
+        &Address::generate(&env),
+        &0,
+        &(MAX_QUERY_RESULTS + 1),
+    );
 }
 
 fn create_sub_for_merchant_and_token(client: &SubscriptionVaultClient<'static>, subscriber: &Address, merchant: &Address, token: &Address) -> u32 {

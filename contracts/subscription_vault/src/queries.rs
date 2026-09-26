@@ -118,6 +118,14 @@ use soroban_sdk::{contracttype, Address, Env, Vec};
 /// (aligned with [`list_subscriptions_by_subscriber`]).
 pub const MAX_SUBSCRIPTION_LIST_PAGE: u32 = 100;
 
+/// Hard upper bound on the `limit` parameter for [`list_subscriptions_by_subscriber`].
+///
+/// Requests with `limit > MAX_QUERY_RESULTS` are rejected with
+/// [`Error::InvalidExportLimit`] (code 6004) before any storage reads occur.
+/// This cap prevents a single call from enumerating an unbounded number of
+/// subscription IDs, bounding per-call Soroban resource consumption.
+pub const MAX_QUERY_RESULTS: u32 = 100;
+
 /// Maximum number of subscription IDs scanned in a single
 /// [`list_subscriptions_by_subscriber`] call.
 ///
@@ -470,8 +478,8 @@ pub fn list_subscriptions_by_subscriber(
     start_from_id: u32,
     limit: u32,
 ) -> Result<SubscriptionsPage, Error> {
-    if limit == 0 || limit > MAX_SUBSCRIPTION_LIST_PAGE {
-        return Err(Error::InvalidInput);
+    if limit == 0 || limit > MAX_QUERY_RESULTS {
+        return Err(Error::InvalidExportLimit);
     }
 
     let index: Vec<u32> = env
