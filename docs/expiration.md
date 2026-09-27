@@ -1,125 +1,145 @@
-# Expiration Rules and Cleanup Semantics
+# Subscription Expiration Semantics
 
-This document outlines the expiration lifecycle, cleanup mechanisms, and fund safety guarantees for subscriptions in the StellaBill system.
+This document defines the boundary semantics for subscription expiration in the subscription vault contract.
 
-## 1. Expiration Model
+## Overview
 
-Subscriptions carry two independent expiration bounds. Either being met is sufficient to consider the subscription expired for charging, deposit, and state-transition purposes.
+Subscriptions support optional expiration via two independent bounds:
+1. **Wall-clock expiration** (`expires_at: Option<u64>`) — timestamp-based expiration
+2. **Ledger-sequence expiration** (`expires_at_ledger: Option<u32>`) — block-height-based expiration
 
-| Field | Type | Meaning |
-|---|---|---|
-| `start_time` | `u64` | Timestamp when the subscription was created. |
-| `expires_at` | `Option<u64>` | Wall-clock bound. `None` means no time-based expiration. |
-| `expires_at_ledger` | `Option<u32>` | Ledger-sequence bound. `None` means no sequence-based expiration. |
+Either bound being met (or both) causes the subscription to transition to the `Expired` status.
 
-A subscription is considered expired when:
+## Boundary Semantics
+
+### Wall-Clock Expiration
+
+A subscription is considered **expired** when:
+
 ```rust
-current_time    >= expires_at        // wall-clock bound
-    OR
-current_ledger >= expires_at_ledger // ledger-sequence bound
+current_timestamp >= expires_at
 ```
-(Each `None` disables its respective check.)
 
-The dual-bound model supports two distinct use-cases:
+This is an **inclusive** boundary check. The moment the ledger timestamp reaches the `expires_at` value, the subscription is expired.
 
-- **`expires_at`** — wall-clock guarantees for time-sensitive plans (subscriptions, monthly billings).
-- **`expires_at_ledger`** — deterministic termination for **auction-style** plans (a fixed slot count regardless of network speed) and **testnet reproducibility** (the test terminates at a known slot regardless of clock drift). Either or both bounds may be set.
+**Examples:**
+- If `expires_at = 1000` and `current_timestamp = 999`: **Not expired** (charge succeeds)
+- If `expires_at = 1000` and `current_timestamp = 1000`: **Expired** (charge rejected)
+- If `expires_at = 1000` and `current_timestamp = 1001`: **Expired** (charge rejected)
 
-## 2. State Transitions
+### Ledger-Sequence Expiration
 
-Subscriptions transition through several states, but expiration introduces explicit guards:
+A subscription is considered **expired** when:
 
-- **Active**: The subscription is actively charging and valid.
-- **Expired**: Evaluated dynamically based on `is_expired()`. This state takes precedence over active billing operations.
-- **Cancelled**: A terminal state explicitly triggered by the user or system.
-- **Archived**: A clean-up state that preserves essential data and allows fund withdrawals while preventing all other operations.
+```rust
+current_ledger_sequence >= expires_at_ledger
+```
 
-**Important Distinction:**
-- **Expired** is automatic. A subscription whose `expires_at` (wall-clock) **or** `expires_at_ledger` (sequence) is reached is immediately ineligible for charging, even if its state is nominally `Active`.
-- **Cancelled** is user-driven or system-driven (e.g., reaching a lifetime cap).
-- These states are mutually exclusive in behavior. An expired subscription cannot be cancelled, but both can be **Archived**.
+This is also an **inclusive** boundary check, mirroring the wall-clock semantics.
 
-## 3. Expiration Effects
+**Examples:**
+- If `expires_at_ledger = 500` and `current_sequence = 499`: **Not expired**
+- If `expires_at_ledger = 500` and `current_sequence = 500`: **Expired**
+- If `expires_at_ledger = 500` and `current_sequence = 501`: **Expired**
 
-When a subscription is expired (`is_expired == true`):
+### Combined Bounds
 
-- **Rejected Operations**:
-  - New periodic charges (`charge_subscription`)
-  - New usage-based charges (`charge_usage`)
-  - New fund deposits (`deposit_funds`)
-  - Explicit cancellation (`cancel_subscription`)
+When both bounds are set, the subscription expires when **either** condition is met (logical OR):
 
-- **Allowed Operations**:
-  - Subscriber fund withdrawals (`withdraw_subscriber_funds`)
-  - Metadata reads and general state queries
-  - Archival cleanup (`cleanup_subscription`)
+```rust
+is_expired = (current_timestamp >= expires_at) || (current_ledger_sequence >= expires_at_ledger)
+```
 
-## 4. Ledger-Sequence Expiration Bound
+The **earliest** bound to be reached triggers the expiration.
 
-The ledger-sequence bound (`expires_at_ledger`) provides a deterministic, time-independent termination condition. It is set in either of two ways:
+## Implementation Reference
 
-1. **At creation** — pass `Some(seq)` as the 9th argument to `create_subscription` / `create_subscription_with_token`. The contract rejects `seq <= current_ledger` with `Error::InvalidExpiration` (zombie prevention).
-2. **After creation** — call `set_subscription_expiration_ledger(subscription_id, authorizer, Some(seq))`. Authorized by the subscriber **or** the merchant (mirroring the auth surface of `cancel_subscription`, `pause_subscription`, and `schedule_cancel`). Pass `None` to clear an existing bound.
+The boundary check is implemented in `types.rs`:
 
-### Setter validation
-- Subscription must exist and not be in a terminal state (`Cancelled` / `Expired` / `Archived`).
-- `Some(seq)` must be strictly greater than the current ledger sequence.
+```rust
+pub fn is_expired(&self, current_time: u64, current_ledger: u32) -> bool {
+    if let Some(exp) = self.expires_at {
+        if current_time >= exp {
+            return true;
+        }
+    }
+    if let Some(exp_ledger) = self.expires_at_ledger {
+        if current_ledger >= exp_ledger {
+            return true;
+        }
+    }
+    false
+}
+```
 
-### Event
-`ExpirationLedgerSetEvent { subscription_id, expires_at_ledger, previous_expires_at_ledger, authorizer, timestamp, schema_version }` is emitted on every successful call. The `previous_expires_at_ledger` field lets indexers reconstruct the bound's lifecycle even when `None` clears an existing value.
+## Operations Affected by Expiration
 
-## 5. Cleanup Semantics & Archival Strategy
+When a subscription is expired (either bound met), the following operations are **rejected** with `Error::SubscriptionExpired`:
 
-Instead of deleting expired or cancelled subscriptions (which could corrupt the state and lead to fund loss), StellaBill uses an **Archival Strategy**.
+1. **`charge_subscription`** — No charges can be processed
+2. **`deposit_funds`** — No funds can be added
+3. **`charge_usage`** — Usage-based charging is blocked
+4. **`cancel_subscription`** — Cannot cancel an expired subscription (cleanup instead)
 
-The `cleanup_subscription` function allows moving a terminal subscription (either Cancelled or Expired) into the `Archived` state.
+### Operations Still Permitted
 
-### Archival Guarantees:
-- **No Deletion**: The subscription entity is preserved. Critical fields (balances, identities) remain intact.
-- **Readability**: Archived entities can still be read by indexers and clients.
-- **Safety**: Moving to `Archived` enforces strict terminal behavior, ensuring no accidental resumption or modification.
+The following operations remain available after expiration:
 
-## 6. Fund Safety Guarantee
+1. **`withdraw_subscriber_funds`** — Subscribers can withdraw remaining prepaid balance
+2. **`cleanup_subscription`** — Transitions the subscription to `Archived` status
+3. **`get_subscription`** — Query operations continue to work
 
-A core invariant of the StellaBill protocol is that **funds are never deleted**.
-- If a subscription expires or is archived, any remaining escrowed funds in `prepaid_balance` remain assigned to that subscription.
-- The `withdraw_subscriber_funds` function explicitly permits withdrawals when the status is `Expired`, `Cancelled`, or `Archived`.
-- This ensures subscribers can always retrieve their unused prepaid balances, regardless of the subscription's terminal state.
+## Creation-Time Validation
 
-## 7. Examples
+Subscriptions cannot be created with an expiration already in the past or equal to the current time:
 
-### Flow 1: Expiration without Cancellation
-1. Subscription created with `expires_at = T` (and optionally `expires_at_ledger = S`).
-2. Time passes. Current time becomes `>= T` (or current ledger sequence becomes `>= S`).
-3. The subscription is now automatically **Expired**. New charges fail.
-4. The user or merchant calls `cleanup_subscription`.
-5. State transitions to **Archived**.
-6. The user withdraws their remaining funds.
+- `expires_at <= current_timestamp` → **Rejected** with `Error::InvalidExpiration`
+- `expires_at_ledger <= current_sequence` → **Rejected** with `Error::InvalidExpiration`
 
-### Flow 2: Cancellation before Expiration
-1. Subscription created with `expires_at = T` (and optionally `expires_at_ledger = S`).
-2. Current time is `< T` **and** current sequence is `< S`. User calls `cancel_subscription`.
-3. State explicitly transitions to **Cancelled**.
-4. The user or merchant calls `cleanup_subscription`.
-5. State transitions to **Archived**.
-6. User withdraws funds.
+The minimum valid expiration is:
+- `expires_at >= current_timestamp + 1` (one second in the future)
+- `expires_at_ledger >= current_sequence + 1` (one block in the future)
 
-### Flow 3: Ledger-Bound Only (Auction / Testnet)
-1. Subscription created with `expires_at = None, expires_at_ledger = S`.
-2. Charges succeed while `current_ledger < S`.
-3. Once `current_ledger >= S`, every charge / deposit / cancel attempt is rejected.
-4. Cleanup → Archived → withdraw.
+This prevents "zombie" subscriptions that are born already expired and can never be charged.
 
-## 8. Storage Migration
+## Rationale
 
-Adding `expires_at_ledger` is a schema change. The contract's `STORAGE_VERSION` constant is bumped to **4** in this release, and the `v3 → v4` step in [`admin::do_migrate`](../contracts/subscription_vault/src/admin.rs) walks every `DataKey::Sub(id)` record and rewrites it so the new trailing field deserializes cleanly.
+### Why Inclusive Boundary?
 
-**Operators MUST call `migrate(admin)` once after deploying the new binary** to prevent `get_subscription` from panicking on existing records. The migration is idempotent and only touches the persistent storage tier.
+The inclusive boundary (`>=`) provides clear semantics:
+- **No ambiguity**: The exact moment the clock reaches the expiration time, the subscription expires
+- **Indexer-friendly**: Off-chain indexers can compute the exact block/timestamp when expiration occurs
+- **Simpler reasoning**: Users understand "expires at T" to mean "stops working at T"
 
-## 9. Indexer Guidance
+### Why Two Expiration Bounds?
 
-Indexers tracking the state of subscriptions should:
-1. Always compute `is_expired = (current_time >= expires_at) OR (current_ledger >= expires_at_ledger)` when displaying active subscriptions. Either bound being met terminates charging.
-2. Treat `Archived` subscriptions as immutable, terminal records.
-3. Monitor `SubscriptionExpiredEvent`, `SubscriptionArchivedEvent`, and `ExpirationLedgerSetEvent` to trigger backend cleanups or UI updates.
-4. Use `previous_expires_at_ledger` in `ExpirationLedgerSetEvent` to reconstruct the bound's lifecycle when `None` clears an existing value.
+Different use cases benefit from different expiration models:
+
+1. **Wall-clock** (`expires_at`):
+   - Real-world time-based subscriptions (e.g., "30-day trial")
+   - Suitable when time is the relevant constraint
+
+2. **Ledger-sequence** (`expires_at_ledger`):
+   - Block-height-based expiration for on-chain coordination
+   - Suitable for governance or time-locked operations where ledger progression matters
+
+Having both allows users to choose the appropriate model or combine them for defense-in-depth.
+
+## Test Coverage
+
+Boundary behavior is verified in `test_expiration.rs`:
+
+- `test_charge_at_exact_expiration_boundary_rejected` — Charge at `timestamp == expires_at` is rejected
+- `test_deposit_at_exact_expiration_boundary_rejected` — Deposit at boundary is rejected
+- `test_charge_rejected_when_ledger_bound_met` — Ledger-sequence expiration works identically
+- `test_both_bounds_set_ledger_fires_first` — Earliest bound wins when both are set
+- `test_both_bounds_set_wall_clock_fires_first` — Wall-clock can fire before ledger bound
+
+## Summary
+
+- **Expiration boundary**: `current_time >= expires_at` (inclusive)
+- **Ledger boundary**: `current_sequence >= expires_at_ledger` (inclusive)
+- **At the exact boundary timestamp/sequence**: subscription is **expired**
+- **Operations rejected**: charge, deposit, charge_usage, cancel
+- **Operations permitted**: withdraw, cleanup, query
+- **Creation validation**: expiration must be strictly in the future

@@ -615,3 +615,194 @@ fn bulk_cancel_replay_rejected() {
         .try_bulk_cancel_subscriptions(&te.admin, &vec![&te.env, b], &0u64);
     assert_eq!(res, Err(Ok(Error::NonceAlreadyUsed)));
 }
+
+// ── Bulk operations: atomicity and partial failure semantics ────────────────
+
+/// Verify that bulk_pause processes all IDs even when some fail, and returns
+/// a result for each ID (partial-failure tolerance, not atomicity).
+///
+/// Current implementation: bulk operations are **best-effort**, not atomic.
+/// A failure mid-batch does not roll back earlier changes. This test documents
+/// that behavior and ensures callers can inspect per-ID results.
+#[test]
+fn bulk_pause_partial_failures_documented() {
+    let te = TestEnv::default();
+    let subscriber = Address::generate(&te.env);
+    let merchant = Address::generate(&te.env);
+
+    // Create mix of: active, paused, expired, and missing subscriptions
+    let active = funded_sub(&te, &subscriber, &merchant);
+    let paused = funded_sub(&te, &subscriber, &merchant);
+    te.client.pause_subscription(&paused, &merchant);
+
+    // Create an expired subscription
+    let now = te.env.ledger().timestamp();
+    let expired_id = te.client.create_subscription(
+        &subscriber,
+        &merchant,
+        &AMOUNT,
+        &INTERVAL,
+        &false,
+        &None,
+        &Some(now + 10), // expires soon
+        &None::<u32>,
+    );
+    te.stellar_token_client().mint(&subscriber, &DEPOSIT);
+    te.client.deposit_funds(&expired_id, &DEPOSIT, &None);
+    te.jump(100); // past expiration
+
+    let missing = 9_999u32;
+
+    // Bulk pause all four: [active (succeeds), paused (skipped), expired (fails), missing (fails)]
+    let results = te.client.bulk_pause_subscriptions(
+        &te.admin,
+        &vec![&te.env, active, paused, expired_id, missing],
+        &0u64,
+    );
+
+    assert_eq!(results.len(), 4, "must return result for every ID");
+
+    // Active: changed
+    assert!(results.get(0).unwrap().success && results.get(0).unwrap().changed);
+    assert_eq!(status(&te, active), SubscriptionStatus::Paused);
+
+    // Already paused: success but not changed
+    assert!(results.get(1).unwrap().success && !results.get(1).unwrap().changed);
+    assert_eq!(status(&te, paused), SubscriptionStatus::Paused);
+
+    // Expired: failure
+    assert!(!results.get(2).unwrap().success);
+    assert_eq!(
+        results.get(2).unwrap().error_code,
+        Error::SubscriptionExpired.to_code()
+    );
+
+    // Missing: failure
+    assert!(!results.get(3).unwrap().success);
+    assert_eq!(
+        results.get(3).unwrap().error_code,
+        Error::NotFound.to_code()
+    );
+
+    // The first subscription was paused despite later failures — this is
+    // the documented partial-completion semantic.
+}
+
+/// Verify that bulk_cancel processes all IDs with partial failures and does
+/// not roll back earlier successful cancellations.
+#[test]
+fn bulk_cancel_partial_failures_refunds_successful_only() {
+    let te = TestEnv::default();
+    let subscriber = Address::generate(&te.env);
+    let merchant = Address::generate(&te.env);
+
+    let sub_a = funded_sub(&te, &subscriber, &merchant);
+    let sub_b = funded_sub(&te, &subscriber, &merchant);
+    let missing = 7_777u32;
+
+    // Subscriber has deposited 2 * DEPOSIT, but all funds are in the contract
+    assert_eq!(token_balance(&te, &subscriber), 0);
+
+    // Bulk cancel: [sub_a (succeeds), missing (fails), sub_b (succeeds)]
+    let results = te.client.bulk_cancel_subscriptions(
+        &te.admin,
+        &vec![&te.env, sub_a, missing, sub_b],
+        &0u64,
+    );
+
+    assert_eq!(results.len(), 3);
+
+    // sub_a: cancelled and refunded
+    assert!(results.get(0).unwrap().success && results.get(0).unwrap().changed);
+    assert_eq!(status(&te, sub_a), SubscriptionStatus::Cancelled);
+
+    // missing: failed
+    assert!(!results.get(1).unwrap().success);
+    assert_eq!(
+        results.get(1).unwrap().error_code,
+        Error::NotFound.to_code()
+    );
+
+    // sub_b: cancelled and refunded
+    assert!(results.get(2).unwrap().success && results.get(2).unwrap().changed);
+    assert_eq!(status(&te, sub_b), SubscriptionStatus::Cancelled);
+
+    // Both successful cancellations were refunded despite the missing ID failure
+    assert_eq!(
+        token_balance(&te, &subscriber),
+        DEPOSIT * 2,
+        "successful cancellations must refund even when other IDs fail"
+    );
+}
+
+/// Verify that if a failure occurs in the middle of a batch, later IDs are
+/// still processed (no early abort).
+#[test]
+fn bulk_operations_do_not_abort_on_first_failure() {
+    let te = TestEnv::default();
+    let subscriber = Address::generate(&te.env);
+    let merchant = Address::generate(&te.env);
+
+    let first = funded_sub(&te, &subscriber, &merchant);
+    let missing = 1_111u32; // will fail
+    let last = funded_sub(&te, &subscriber, &merchant);
+
+    // Bulk pause: [first (succeeds), missing (fails), last (should still be processed)]
+    let results = te.client.bulk_pause_subscriptions(
+        &te.admin,
+        &vec![&te.env, first, missing, last],
+        &0u64,
+    );
+
+    assert_eq!(results.len(), 3);
+
+    // First: paused
+    assert!(results.get(0).unwrap().success);
+    assert_eq!(status(&te, first), SubscriptionStatus::Paused);
+
+    // Missing: failed
+    assert!(!results.get(1).unwrap().success);
+
+    // Last: paused (confirms no early abort)
+    assert!(
+        results.get(2).unwrap().success,
+        "bulk operation must continue after mid-batch failure"
+    );
+    assert_eq!(status(&te, last), SubscriptionStatus::Paused);
+}
+
+/// Document atomicity semantics: bulk operations are **not** atomic.
+/// On partial failure, successful changes persist. This is intentional
+/// for operational resilience.
+#[test]
+fn bulk_operations_are_not_atomic_successful_changes_persist() {
+    let te = TestEnv::default();
+    let subscriber = Address::generate(&te.env);
+    let merchant = Address::generate(&te.env);
+
+    let good = funded_sub(&te, &subscriber, &merchant);
+    let bad = 5_555u32; // missing
+
+    // Record initial state
+    assert_eq!(status(&te, good), SubscriptionStatus::Active);
+
+    // Bulk pause with one success and one failure
+    let results = te
+        .client
+        .bulk_pause_subscriptions(&te.admin, &vec![&te.env, good, bad], &0u64);
+
+    // good was paused, bad failed
+    assert!(results.get(0).unwrap().success);
+    assert!(!results.get(1).unwrap().success);
+
+    // The successful pause persists — there is no rollback
+    assert_eq!(
+        status(&te, good),
+        SubscriptionStatus::Paused,
+        "successful operations in a bulk batch are not rolled back on partial failure"
+    );
+
+    // Document: if all-or-nothing behavior is required, the caller must verify
+    // all IDs exist before calling bulk operations, or implement their own
+    // rollback logic by inspecting the returned results.
+}
