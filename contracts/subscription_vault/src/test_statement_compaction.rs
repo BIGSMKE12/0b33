@@ -194,3 +194,87 @@ fn falls_back_to_global_retention_config() {
     assert_eq!(summary.kept_count, 3);
     assert_eq!(summary.pruned_count, 5);
 }
+
+/// INVARIANT: After compaction, sum(retained statements) + compacted_aggregate.total_amount
+/// must equal the original total_charged amount recorded elsewhere in the subscription.
+///
+/// This test verifies that statement compaction preserves the total charged amount invariant,
+/// ensuring no billing history is lost or double-counted during compaction.
+#[test]
+fn compaction_preserves_total_charged_amount_invariant() {
+    let (env, contract_id) = setup();
+    let sub_id = 7u32;
+    
+    // Append statements with known amounts
+    let appended_total = append_known_sequence(&env, &contract_id, sub_id, 15);
+    
+    // Record the expected total before compaction
+    let expected_total = appended_total;
+    
+    // Compact, keeping recent 5 statements
+    let summary = env.as_contract(&contract_id, || {
+        compact_subscription_statements(&env, sub_id, Some(5)).unwrap()
+    });
+    
+    // Verify pruned + kept = original total
+    assert_eq!(summary.pruned_count + summary.kept_count, 15);
+    
+    // Get the compacted aggregate
+    let aggregate = env.as_contract(&contract_id, || get_compacted_aggregate(&env, sub_id));
+    
+    // Get remaining statements
+    let page = env.as_contract(&contract_id, || {
+        crate::statements::get_statements_by_subscription_offset(&env, sub_id, 0, 100, false).unwrap()
+    });
+    
+    // Sum of retained statements
+    let retained_sum: i128 = page.statements.iter().map(|s| s.amount).sum();
+    
+    // INVARIANT CHECK: compacted_aggregate.total_amount + sum(retained) == original total
+    let reconstructed_total = aggregate.total_amount + retained_sum;
+    assert_eq!(
+        reconstructed_total, 
+        expected_total,
+        "Compaction must preserve total charged amount: aggregate({}) + retained({}) != original({})",
+        aggregate.total_amount,
+        retained_sum,
+        expected_total
+    );
+    
+    // Verify the sum also matches what we know was pruned vs kept
+    assert_eq!(summary.total_pruned_amount, aggregate.total_amount);
+}
+
+/// INVARIANT DOCUMENTATION: Verify that the total charged amount invariant is documented
+/// in docs/billing_statements.md (this test ensures we don't forget the documentation).
+///
+/// This is a documentation test — it verifies that the billing_statements.md file exists
+/// and contains the invariant documentation. If this test is added before the docs exist,
+/// it should fail to remind us to document the invariant.
+#[test]
+fn verify_compaction_invariant_is_documented() {
+    // This test reads the documentation file to ensure the invariant is documented.
+    // If the file doesn't exist or doesn't contain the invariant, the test fails.
+    
+    let docs_path = std::path::Path::new("../../docs/billing_statements.md");
+    
+    if !docs_path.exists() {
+        panic!(
+            "Documentation file missing: docs/billing_statements.md must document the \
+             'total charged amount invariant' for statement compaction"
+        );
+    }
+    
+    let contents = std::fs::read_to_string(docs_path)
+        .expect("Failed to read docs/billing_statements.md");
+    
+    // Check that the invariant is mentioned
+    let has_invariant_doc = contents.contains("total charged amount") 
+        || contents.contains("compaction preserves")
+        || contents.contains("invariant");
+    
+    assert!(
+        has_invariant_doc,
+        "docs/billing_statements.md must document the total charged amount invariant for compaction"
+    );
+}

@@ -50,6 +50,79 @@ proptest! {
             prop_assert_eq!(res_high, amount, "remaining_seconds >= interval must yield full amount");
         }
     }
+
+    /// Expanded fuzz corpus: amounts near overflow boundaries, prime numbers,
+    /// and edge cases that may trigger rounding errors in safe_math.rs.
+    #[test]
+    fn fuzz_prorated_charge_expanded_corpus(
+        // Sample from boundary regions more frequently
+        amount_selector in 0..=10u8,
+        interval in 1..=u64::MAX,
+        remaining in 0..=u64::MAX,
+    ) {
+        // Expanded corpus covering:
+        // - Amounts near i128::MAX / 2
+        // - Prime numbers
+        // - Powers of 2
+        // - Small amounts
+        let amount = match amount_selector {
+            0 => 1,
+            1 => 2,
+            2 => 7, // small prime
+            3 => 127, // Mersenne prime
+            4 => 1_000_000,
+            5 => i128::MAX / 4,
+            6 => i128::MAX / 2 - 1,
+            7 => i128::MAX / 2,
+            8 => i128::MAX / 2 + 1,
+            9 => (1i128 << 100) - 1, // Near 2^100
+            _ => 170141183460469231731687303715884105727i128, // i128::MAX
+        };
+
+        let result = calculate_prorated_first_charge(amount, interval, remaining);
+        
+        // Must never panic or overflow
+        prop_assert!(result.is_ok() || result == Err(Error::Overflow) || result == Err(Error::InvalidAmount));
+        
+        if let Ok(prorated) = result {
+            // Bounds invariant
+            prop_assert!(prorated >= 0, "prorated charge must be non-negative");
+            prop_assert!(prorated <= amount, "prorated charge must not exceed amount");
+            
+            // Boundary cases
+            if remaining == 0 {
+                prop_assert_eq!(prorated, 0);
+            }
+            if remaining >= interval {
+                prop_assert_eq!(prorated, amount);
+            }
+        }
+    }
+
+    /// Fuzz test targeting prime number amounts which may expose rounding errors
+    /// in division operations within safe_math.rs.
+    #[test]
+    fn fuzz_prorated_charge_prime_amounts(
+        prime_idx in 0..20usize,
+        interval in 1..=1_000_000u64,
+        remaining in 0..=1_000_000u64,
+    ) {
+        // List of prime numbers including large primes
+        const PRIMES: [i128; 20] = [
+            2, 3, 5, 7, 11, 13, 17, 19, 23, 29,
+            997, 1009, 10007, 100003, 1000003,
+            999983, 9999991, 99999989, 999999937, 2147483647
+        ];
+        
+        let amount = PRIMES[prime_idx];
+        let result = calculate_prorated_first_charge(amount, interval, remaining);
+        
+        prop_assert!(result.is_ok(), "prime amounts should not cause errors");
+        
+        if let Ok(prorated) = result {
+            prop_assert!(prorated >= 0 && prorated <= amount);
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
