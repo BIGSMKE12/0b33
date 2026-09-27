@@ -44,20 +44,27 @@ The subscription can be in one of four states:
 
 ## State Diagram
 
-```
-                    ┌─────────────────────────────────────────┐
-                    │                                         │
-                    ▼                                         │
-┌─────────┐    ┌─────────┐    ┌─────────┐    ┌─────────────────┴─┐
-│  START  │───▶│  ACTIVE │───▶│ PAUSED  │───▶│   CANCELLED       │
-└─────────┘    └────┬────┘    └────┬────┘    │   (Terminal)      │
-                    │              │         └───────────────────┘
-                    │              │                    ▲
-                    │              └────────────────────┤
-                    │                                   │
-                    │         ┌──────────────────────┐  │
-                    └────────▶│ INSUFFICIENT_BALANCE │──┘
-                              └──────────────────────┘
+```mermaid
+stateDiagram-v2
+    [*] --> Active
+    Active --> Paused: pause_subscription()
+    Active --> Cancelled: cancel_subscription()
+    Active --> GracePeriod: insufficient charge with grace configured
+    Active --> InsufficientBalance: insufficient charge without active grace
+    Active --> Expired: subscription expires
+    Paused --> Active: resume_subscription()
+    Paused --> Cancelled: cancel_subscription()
+    Paused --> Expired: subscription expires
+    GracePeriod --> Active: top-up and deferred charge succeeds during grace
+    GracePeriod --> Active: resume_subscription()
+    GracePeriod --> InsufficientBalance: grace expires and charge fails
+    GracePeriod --> Cancelled: cancel_subscription()
+    GracePeriod --> Expired: subscription expires
+    InsufficientBalance --> Active: resume_subscription() after funding
+    InsufficientBalance --> Cancelled: cancel_subscription()
+    InsufficientBalance --> Expired: subscription expires
+    Cancelled --> Archived: cleanup_subscription()
+    Expired --> Archived: cleanup_subscription()
 ```
 
 ## Grace-period semantics
@@ -81,7 +88,7 @@ Grace period is managed by charge flow on `Active` subscriptions.
 | Active | GracePeriod | `charge_one()` (auto) | Charge failed, grace period active |
 | Active | InsufficientBalance | `charge_one()` (auto) | Charge failed, grace expired |
 | Active | Expired | Any entrypoint (auto) | Subscription expired |
-| GracePeriod | Active | `charge_one()` or `resume_subscription()` | Successful charge or manual resume |
+| GracePeriod | Active | `charge_one()` or `resume_subscription()` | Top-up followed by a successful deferred charge during grace, or manual resume |
 | GracePeriod | InsufficientBalance | `charge_one()` (auto) | Grace period expired |
 | GracePeriod | Cancelled | `cancel_subscription()` | Cancel during grace |
 | GracePeriod | Expired | Any entrypoint (auto) | Subscription expired |
