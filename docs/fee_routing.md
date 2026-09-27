@@ -35,6 +35,20 @@ The division is **integer floor division** — the remainder stays with the
 merchant.  This is the **deterministic rounding rule** and guarantees
 conservation on every charge.
 
+Floor division alone can round a fee down to **zero** on a micro-charge, which
+would leave the protocol with no fee at all on that charge.  So the contract adds
+a **minimum fee of one base unit** whenever `fee_bps > 0` and a treasury is
+configured:
+
+```
+fee  =  max(gross × fee_bps / 10 000, 1)
+```
+
+The floor is applied to the fee in the **settlement token**, before the fee is
+credited to the treasury, and it never changes `net = gross − fee`.  Its
+consequences are covered under
+[Dust and the minimum-fee floor](#dust-and-the-minimum-fee-floor).
+
 ---
 
 ## Concrete Examples
@@ -135,23 +149,86 @@ net   = 1 − 1
 
 The entire amount goes to the treasury; the merchant receives 0.
 
-### Example 7: Sub-unit charge rounding to zero fee
+### Example 7: Sub-unit charge hits the minimum-fee floor
 
-**Setup:** `fee_bps = 250` (2.50 %), charge of **1 unit** (1 raw) — a sub-cent
-amount in a 6-decimal token.
+**Setup:** `fee_bps = 250` (2.50 %), charge of **1 unit** (1 raw) — a sub-cent
+amount in a 6-decimal token, with a treasury configured.
 
 ```
 fee   = 1 × 250 / 10_000
       = 250 / 10_000
-      = 0                  (floor — 0)
+      = 0                  (floor)
 
-net   = 1 − 0
+fee   = max(0, 1)          (minimum-fee floor)
       = 1
+
+net   = 1 − 1
+      = 0
 ```
 
-When the calculated fee is less than one raw unit, it truncates to zero and
-the **entire amount goes to the merchant**.  This is safe because the amounts
-involved are economically negligible (e.g., 1 raw = 0.000 001 USDC).
+Without the floor the fee would truncate to zero and the merchant would keep the
+whole unit.  With it the treasury collects **1 raw unit** and the merchant net is
+0 — conservation still holds (`0 + 1 = 1`).  The single unit is negligible
+(e.g. 1 raw = 0.000 001 USDC) but it is now accounted for instead of silently
+dropped from the fee split.
+
+If `fee_bps == 0`, or if no treasury address is configured, the floor does not
+apply, the fee stays 0, and the merchant keeps the whole gross.
+
+---
+
+## Dust and the Minimum-Fee Floor
+
+### The problem
+
+`fee = gross × fee_bps / 10 000` is integer floor division.  On a charge small
+enough that the fee floors to **zero** — anything below `10 000 / fee_bps` base
+units, e.g. a 1-unit charge at 2.50 % — the protocol would collect nothing.  The
+remainder is not stored anywhere and there is no per-charge record of the
+shortfall, so the amount is simply dropped and the sum of merchant payouts plus
+protocol fees drifts below the sum of charged amounts.
+
+### The strategy: round the fee up to one base unit
+
+Rather than maintain a dust pool, which would need per-token accounting,
+extra storage and its own withdrawal path, the contract rounds a sub-unit fee
+**up to 1 base unit**:
+
+```
+fee = max(gross × fee_bps / 10 000, 1)
+```
+
+This applies wherever a fee is charged — interval, usage and one-off charges
+(`charge_one`, `charge_usage_one`, `do_charge_one_off` in
+`charge_core.rs`).
+
+The floor is conditional, so it never invents a fee where the protocol has
+decided not to collect one:
+
+| Condition | Result |
+|-----------|--------|
+| `fee_bps == 0` | `fee = 0`; merchant keeps the full gross |
+| `fee_bps > 0`, **no treasury configured** | `fee = 0`; merchant keeps the full gross |
+| `fee_bps > 0`, treasury configured, `floor(...) >= 1` | `fee = floor(gross × fee_bps / 10 000)` (unchanged) |
+| `fee_bps > 0`, treasury configured, `floor(...) == 0` | `fee = 1`, `net = gross − 1` |
+
+### Invariants that still hold
+
+- **Conservation is untouched:** `net = gross − fee`, so `net + fee == gross` on
+  every charge, including charges that hit the floor.  The floor moves one unit
+  from the merchant to the treasury; it never creates or destroys value.
+- **The floor only raises a fee, never lowers it.**  A charge whose percentage
+  fee already reaches one base unit is unaffected.
+- **At most one base unit is recovered per charge**, so the correction stays
+  economically negligible next to the charged amount.
+
+### Regression coverage
+
+`contracts/subscription_vault/src/test_fee_routing_dust.rs` pins the
+`net + fee == gross` invariant for small values — including a 1-unit charge at
+`fee_bps = 1` and at `MAX_FEE_BIPS` — and asserts that a modeled
+`max(floor(gross × fee_bps / 10 000), 1)` fee is at least one base unit whenever
+`fee_bps > 0`.
 
 ---
 
@@ -241,9 +318,14 @@ Emitted when the admin calls `set_protocol_fee`.
 1. **Conservation:** `gross == net + fee` on every charge.  Verified in the
    code by subtracting the fee from gross, never by adding.
 
-2. **Rounding favors the merchant:** Integer floor division means any
-   remainder from the fee calculation stays with the merchant.  The treasury
-   never receives more than `floor(gross × fee_bps / 10 000)`.
+2. **Rounding favors the merchant, except at the minimum-fee floor:**
+   Integer floor division keeps any remainder from the fee calculation in the
+   merchant's net.  The one exception is the minimum-fee floor: when `fee_bps > 0`
+   and a treasury is configured, a fee that would floor below 1 base unit is
+   raised to exactly 1.  The treasury therefore receives
+   `max(floor(gross × fee_bps / 10 000), 1)` — never a share of the remainder, and
+   never more than one extra unit on the charges that hit the floor.  See
+   [Dust and the minimum-fee floor](#dust-and-the-minimum-fee-floor).
 
 3. **Fee is computed from discounted amount:** When a coupon is applied,
    the protocol fee is computed from the **post-discount** payable amount,
@@ -273,7 +355,9 @@ Emitted when the admin calls `set_protocol_fee`.
 - [`docs/protocol_fees.md`](protocol_fees.md) — Full protocol fee specification
 - [`docs/merchant_earnings.md`](merchant_earnings.md) — How merchant balances work
 - [`docs/governance/authoring.md`](governance/authoring.md) — Governance proposals for changing fee parameters
+- `contracts/subscription_vault/src/test_fee_routing_dust.rs` — Dust / minimum-fee floor regression tests
 - `contracts/subscription_vault/src/charge_core.rs` — Interval and usage charge fee logic
 - `contracts/subscription_vault/src/subscription.rs` — One-off charge fee logic
 - `contracts/subscription_vault/src/admin.rs` — Fee configuration (`set_protocol_fee`)
 - `contracts/subscription_vault/src/types.rs` — Event structs, `MAX_FEE_BIPS`
+
