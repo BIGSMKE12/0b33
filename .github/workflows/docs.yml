@@ -79,9 +79,9 @@ jobs:
               --jq '.[] | select(.body | contains("<!-- error-table-freshness-check -->")) | .id' | tail -1)
 
             if [ -n "$EXISTING_ID" ]; then
-              gh pr comment ${{ github.event.pull_request.number }} --edit-comment "$EXISTING_ID" --body "$BODY"
+              gh api "repos/${{ github.repository }}/issues/comments/$EXISTING_ID" --method PATCH -f body="$BODY"
             else
-              gh pr comment ${{ github.event.pull_request.number }} --body "$BODY"
+              gh api "repos/${{ github.repository }}/issues/${{ github.event.pull_request.number }}/comments" --method POST -f body="$BODY"
             fi
           else
             echo "docs/errors.md is already up to date."
