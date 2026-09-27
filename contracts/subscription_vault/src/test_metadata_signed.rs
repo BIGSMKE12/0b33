@@ -805,10 +805,11 @@ fn key_cap_reached() {
     }
 
     // 11th new key must be rejected.
+    let overflow_key_name = "k10";
     let payload = payload_for(
         &env,
         sub_id,
-        "k10",
+        overflow_key_name,
         "v",
         crate::MAX_METADATA_KEYS as u64,
         one_hour_from_now(&env),
@@ -817,6 +818,26 @@ fn key_cap_reached() {
     let res =
         client.try_set_metadata_signed(&bytes32(&env, &sub_key.pub_bytes), &payload, &signature);
     assert_eq!(res, Err(Ok(crate::Error::MetadataKeyLimitReached)));
+
+    // Verify storage is completely unchanged:
+    // 1. Rejected key is not present in metadata list
+    let keys = client.list_metadata_keys(&sub_id);
+    assert_eq!(keys.len(), crate::MAX_METADATA_KEYS);
+    let overflow_key_str = String::from_str(&env, overflow_key_name);
+    assert!(!keys.iter().any(|k| k == overflow_key_str));
+
+    // 2. Rejected key returns NotFound on get_metadata
+    assert_eq!(
+        client.try_get_metadata(&sub_id, &overflow_key_str),
+        Err(Ok(crate::Error::NotFound))
+    );
+
+    // 3. Nonce was not consumed
+    let sub_addr = pubkey_to_address(&env, &bytes32(&env, &sub_key.pub_bytes));
+    assert_eq!(
+        client.get_metadata_signed_nonce(&sub_addr),
+        crate::MAX_METADATA_KEYS as u64
+    );
 }
 
 // ── Nonce isolation / overflow guards ────────────────────────────────────────
@@ -1006,6 +1027,15 @@ fn metadata_key_limit_direct_path() {
         let expected = String::from_str(&env, &format!("val{}", n));
         assert_eq!(client.get_metadata(&sub_id, &key), expected);
     }
+
+    // Verify storage is completely unchanged: overflow key was not inserted
+    assert_eq!(
+        client.try_get_metadata(&sub_id, &overflow_key),
+        Err(Ok(crate::Error::NotFound))
+    );
+    let keys = client.list_metadata_keys(&sub_id);
+    assert_eq!(keys.len(), crate::MAX_METADATA_KEYS);
+    assert!(!keys.iter().any(|k| k == overflow_key));
 }
 
 /// Overwriting an existing key when at MAX_METADATA_KEYS must succeed —
