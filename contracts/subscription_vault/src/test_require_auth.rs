@@ -26,7 +26,10 @@
 //! stored value check fails).
 
 use crate::{DataKey, Error, SubscriptionStatus, SubscriptionVault, SubscriptionVaultClient};
-use soroban_sdk::{testutils::Address as _, Address, Env, Vec};
+use soroban_sdk::{
+    testutils::{Address as _, MockAuth, MockAuthInvoke},
+    Address, Env, IntoVal, Val, Vec,
+};
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -544,3 +547,84 @@ fn bulk_deposit_funds_empty_vector_no_op() {
     assert_eq!(results.len(), 0);
 }
 
+// ═════════════════════════════════════════════════════════════════════════════
+// 9. batch_charge — stored admin must authorize
+//
+// `do_batch_charge` opens with `require_stored_admin_auth` →
+// `stored_admin.require_auth()`, and the entrypoint takes no `caller`
+// argument. A subscriber whose own id sits inside the batch therefore cannot
+// satisfy it: because there is no caller address to compare against the stored
+// admin, the rejection is raised by the host auth layer, so
+// `Error::Unauthorized` (1001) is not reachable on this path.
+// ═════════════════════════════════════════════════════════════════════════════
+
+/// Encode the argument list of a `batch_charge(ids, nonce)` call so a single
+/// `batch_charge` invocation can be authorized exactly in `mock_auths`.
+fn batch_charge_args(env: &Env, id: u32, nonce: u64) -> Vec<Val> {
+    let mut ids: Vec<u32> = Vec::new(env);
+    ids.push_back(id);
+    let mut args: Vec<Val> = Vec::new(env);
+    args.push_back(ids.into_val(env));
+    args.push_back(nonce.into_val(env));
+    args
+}
+
+#[test]
+#[should_panic(expected = "Error(Auth, InvalidAction)")]
+fn batch_charge_rejects_subscriber_whose_id_is_in_batch() {
+    let (env, client, _, _) = setup();
+    let (id, subscriber, _) = make_subscription(&env, &client);
+    let mut ids: Vec<u32> = Vec::new(&env);
+    ids.push_back(id);
+
+    // Only the subscriber signs — and the id being charged is its own — yet
+    // `batch_charge` still demands the stored admin's authorization.
+    env.mock_auths(&[MockAuth {
+        address: &subscriber,
+        invoke: &MockAuthInvoke {
+            contract: &client.address,
+            fn_name: "batch_charge",
+            args: batch_charge_args(&env, id, 0),
+            sub_invokes: &[],
+        },
+    }]);
+
+    let _ = client.batch_charge(&ids, &0u64);
+}
+
+#[test]
+fn batch_charge_rejects_non_admin_without_charging() {
+    let (env, client, token, _) = setup();
+    let (id, subscriber, _) = make_subscription(&env, &client);
+
+    // Put real funds behind the subscription so a successful charge would be
+    // observable in the stored balance.
+    soroban_sdk::token::StellarAssetClient::new(&env, &token).mint(&subscriber, &AMOUNT);
+    client.deposit_funds(&id, &subscriber, &AMOUNT, &None);
+    let before = client.get_subscription(&id);
+
+    let mut ids: Vec<u32> = Vec::new(&env);
+    ids.push_back(id);
+    env.mock_auths(&[MockAuth {
+        address: &subscriber,
+        invoke: &MockAuthInvoke {
+            contract: &client.address,
+            fn_name: "batch_charge",
+            args: batch_charge_args(&env, id, 0),
+            sub_invokes: &[],
+        },
+    }]);
+
+    let outcome = client.try_batch_charge(&ids, &0u64);
+    assert!(
+        outcome.is_err(),
+        "batch_charge must reject a non-admin caller; got {outcome:?}"
+    );
+
+    // Rejected wholesale: the batch never ran, so no balance moved and the
+    // subscription is still Active.
+    let after = client.get_subscription(&id);
+    assert_eq!(after.prepaid_balance, before.prepaid_balance);
+    assert_eq!(after.status, SubscriptionStatus::Active);
+    assert_eq!(after.subscriber, subscriber);
+}
