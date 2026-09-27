@@ -53,10 +53,11 @@ The three entrypoint domain values are pairwise distinct (`5`, `6`, `7`) and are
 #### Ring buffer
 
 - Hashes are stored in an `IdemRingBuffer` struct capped at `IDEM_HISTORY = 64` entries per subscription.
-- Each entry stores `(hash, inserted_at_timestamp)`. On lookup, entries older than `IDEM_TTL_SECS = 7 days` are skipped and treated as absent, regardless of ring position.
-- A `cursor` field tracks where the next entry will be written. When the buffer is full, the oldest entry (by ring position) is silently overwritten (cursor wraps around).
+- Each entry stores `(hash, inserted_at_timestamp)`. On lookup, entries older than the configured TTL are skipped and treated as absent, regardless of ring position.
+- The admin configures the contract-wide TTL in seconds with `set_idempotency_ttl`; zero is rejected. It defaults to `IDEM_TTL_SECS = 7 days`, and `get_idempotency_ttl` returns the active value.
+- When a new key is written, entries at or beyond the TTL are removed from that subscription's stored buffer. If the buffer is still full, its oldest live entry is evicted.
 - **Storage**: One `IdemRingBuffer` per subscription (key: `DataKey::IdemKey(subscription_id)`).
-- **Combined guarantee**: An attacker must submit 64 distinct charges to the same subscription *within a 7-day window* to cycle out a single hash. This is infeasible under any normal subscription billing cadence.
+- **Combined guarantee**: An attacker must submit 64 distinct charges to the same subscription within the configured TTL to cycle out a single hash. Choose a TTL that matches the application's retry policy.
 
 ### Batch charge
 
@@ -93,7 +94,7 @@ This separation is enforced by the type system (different `DataKey` variants) an
 
 5. **Optional but recommended:** Persist idempotency keys in your billing engine (e.g. per subscription and period) so that retries use the same key.
 
-6. **Retry window.** Idempotency entries expire after 7 days (`IDEM_TTL_SECS`). Retries must use the same key within that window. After 7 days (or after 64 newer operations on the same subscription, whichever comes first), the oldest hash is evicted and a retry with that key would be processed as a fresh operation.
+6. **Retry window.** Idempotency entries expire after the configured duration (7 days by default). Retries must use the same key within that window. After expiry or after 64 newer operations on the same subscription, the key may be processed as a fresh operation.
 
 ## Required parameters and behavior (Rustdoc summary)
 
@@ -115,7 +116,7 @@ This separation is enforced by the type system (different `DataKey` variants) an
 - **Clock skew / timestamp manipulation:** Period is derived from ledger timestamp. Validators set ledger time; contract does not rely on caller-provided time. Mitigation: trust the network's ledger timestamp.
 - **Unbounded growth:** Only one period index and one `IdemRingBuffer` (≤ 64 entries × (32 + 8) bytes = ~2,560 bytes per subscription) are stored. No unbounded growth from replay protection.
 - **Key collision:** If an integrator reuses the same 32-byte key for two different billing periods on the same entrypoint, the second period's charge would be treated as idempotent (return Ok without charging). Mitigation: derive keys from period (e.g. include period start or index in the key).
-- **Ring buffer eviction:** A retry delayed by more than 7 days (or after 64 newer operations on the same subscription) will miss the ring buffer and execute as a fresh charge. Use `None` or keep retries within the TTL window.
+- **Ring buffer eviction:** A retry delayed beyond the configured TTL (or after 64 newer operations on the same subscription) will miss the ring buffer and execute as a fresh charge. Use `None` or keep retries within the TTL window.
 - **Cross-entrypoint safety:** Domain separation in the hash prevents the same raw key from replaying across `charge_subscription`, `deposit_funds`, and `charge_one_off`.
 
 ---

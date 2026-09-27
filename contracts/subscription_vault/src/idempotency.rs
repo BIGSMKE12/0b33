@@ -10,17 +10,12 @@
 //! ## Replay-protection window
 //!
 //! Each entry stores the hash **and** the ledger timestamp at insertion.
-//! `check_key` ignores entries older than `IDEM_TTL_SECS`; they are treated
-//! as if they were never inserted.  This bounds the replay-protection window
-//! to a fixed time duration rather than a fixed count of operations, closing
-//! the ring-cycling attack described in issue #13.
-//!
-//! `push_key` still evicts the oldest slot by cursor position when the buffer
-//! is full, so storage usage stays bounded at `IDEM_HISTORY` entries regardless
-//! of charge frequency.
+//! `check_key` ignores entries older than the configured TTL; they are treated
+//! as if they were never inserted. `push_key` removes expired entries before
+//! persisting a new key.
 
-use crate::types::DataKey;
-use soroban_sdk::{contracttype, BytesN, Env, Vec};
+use crate::types::{DataKey, Error};
+use soroban_sdk::{contracttype, BytesN, Env, Symbol, Vec};
 
 /// Number of idempotency slots retained per subscription.
 ///
@@ -28,23 +23,44 @@ use soroban_sdk::{contracttype, BytesN, Env, Vec};
 /// over two months) while keeping per-subscription storage overhead small.
 pub(crate) const IDEM_HISTORY: u32 = 64;
 
-/// Duration in seconds for which an idempotency entry remains active.
+/// Default duration in seconds for which an idempotency entry remains active.
 ///
 /// Set to 7 days: long enough to survive any reasonable retry window for
 /// weekly or monthly subscriptions, short enough that a cycling attack
 /// would require 64 charges within the TTL window to succeed — a scenario
 /// that cannot happen under normal subscription billing frequencies.
 pub(crate) const IDEM_TTL_SECS: u64 = 7 * 24 * 60 * 60; // 7 days
+const IDEM_TTL_KEY: &str = "idem_ttl";
 
 /// Ring buffer of recently seen idempotency-key hashes with insertion timestamps.
 ///
-/// Each entry is `(hash, inserted_at_timestamp)`.  Entries older than
-/// `IDEM_TTL_SECS` are considered expired and will not match on lookup.
+/// Each entry is `(hash, inserted_at_timestamp)`. Entries older than the
+/// configured TTL are considered expired and will not match on lookup.
 #[contracttype]
 #[derive(Clone, Debug)]
 pub(crate) struct IdemRingBuffer {
     pub entries: Vec<(BytesN<32>, u64)>,
     pub cursor: u32,
+}
+
+/// Return the configured idempotency-key lifetime, defaulting to seven days.
+pub fn get_ttl_secs(env: &Env) -> u64 {
+    env.storage()
+        .instance()
+        .get(&Symbol::new(env, IDEM_TTL_KEY))
+        .unwrap_or(IDEM_TTL_SECS)
+}
+
+/// Set the contract-wide idempotency-key lifetime.
+pub fn set_ttl_secs(env: &Env, ttl_secs: u64) -> Result<(), Error> {
+    if ttl_secs == 0 {
+        return Err(Error::InvalidInput);
+    }
+
+    env.storage()
+        .instance()
+        .set(&Symbol::new(env, IDEM_TTL_KEY), &ttl_secs);
+    Ok(())
 }
 
 /// Return the raw byte representation of a 32-byte idempotency key.
@@ -114,10 +130,11 @@ pub(crate) fn check_key_at(
     now: u64,
 ) -> bool {
     let buf = load_buffer(env, subscription_id);
+    let ttl_secs = get_ttl_secs(env);
     for entry in buf.entries.iter() {
         let (stored_hash, inserted_at) = entry;
         // Skip entries that have aged out of the replay-protection window.
-        if now.saturating_sub(inserted_at) >= IDEM_TTL_SECS {
+        if now.saturating_sub(inserted_at) >= ttl_secs {
             continue;
         }
         if stored_hash == *hashed {
@@ -132,21 +149,36 @@ pub(crate) fn check_key_at(
 /// `now` must be the current ledger timestamp so that the TTL check in
 /// `check_key` can determine whether each entry is still active.
 ///
-/// When the buffer is full the oldest entry (at `cursor`) is silently
-/// overwritten.
+/// Expired entries are removed before insertion. If the buffer remains full,
+/// the oldest live entry is evicted.
 pub fn push_key(env: &Env, subscription_id: u32, hashed: &BytesN<32>, now: u64) {
     let mut buf = load_buffer(env, subscription_id);
+    let ttl_secs = get_ttl_secs(env);
+    let len = buf.entries.len();
+    if len > 0 {
+        let start = if len == IDEM_HISTORY {
+            buf.cursor % len
+        } else {
+            0
+        };
+        let mut retained = Vec::new(env);
+        for offset in 0..len {
+            let idx = (start + offset) % len;
+            let entry = buf.entries.get(idx).unwrap();
+            if now.saturating_sub(entry.1) < ttl_secs {
+                retained.push_back(entry);
+            }
+        }
+        buf.entries = retained;
+    }
+
     let entry = (hashed.clone(), now);
     if buf.entries.len() < IDEM_HISTORY {
         buf.entries.push_back(entry);
     } else {
-        let idx = buf.cursor as usize % IDEM_HISTORY as usize;
-        if idx < buf.entries.len() as usize {
-            buf.entries.set(idx as u32, entry);
-        } else {
-            buf.entries.push_back(entry);
-        }
+        buf.entries.remove(0);
+        buf.entries.push_back(entry);
     }
-    buf.cursor = buf.cursor.wrapping_add(1) % IDEM_HISTORY;
+    buf.cursor = 0;
     save_buffer(env, subscription_id, &buf);
 }

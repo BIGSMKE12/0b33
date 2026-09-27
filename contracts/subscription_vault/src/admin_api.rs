@@ -34,6 +34,8 @@
 //! | `rotate_merchant_address` | [`crate::merchant::do_rotate_merchant_address`] |
 //! | `set_grace_period` | [`crate::admin::do_set_grace_period`] |
 //! | `get_grace_period` | [`crate::admin::get_grace_period`] |
+//! | `set_idempotency_ttl` | [`crate::idempotency::set_ttl_secs`] |
+//! | `get_idempotency_ttl` | [`crate::idempotency::get_ttl_secs`] |
 //!
 //! ## Two-step Admin Proposal
 //! | Entrypoint | Delegate |
