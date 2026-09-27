@@ -76,6 +76,9 @@ pub const BILLING_PERIOD_SNAPSHOT_TTL_THRESHOLD: u32 = 30 * 24 * 60 * 60; // 30 
 /// Target TTL for billing period snapshot entries when extended.
 pub const BILLING_PERIOD_SNAPSHOT_TTL_EXTEND_TO: u32 = 365 * 24 * 60 * 60; // 365 days
 
+/// Maximum number of recent billing period snapshots retained per subscription.
+pub const MAX_BILLING_PERIOD_SNAPSHOTS_PER_SUBSCRIPTION: u32 = 365;
+
 /// Number of idempotency slots retained per subscription.
 ///
 /// Must stay in sync with `idempotency::IDEM_HISTORY`.

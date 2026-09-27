@@ -53,6 +53,8 @@ mod subscription;
 mod test_datakey_layout;
 #[cfg(test)]
 mod test_merchant_tags;
+#[cfg(test)]
+mod test_billing_period_snapshots;
 mod types;
 mod validation;
 
