@@ -119,6 +119,38 @@ fn test_charge_one_second_before_boundary_fails() {
     assert_eq!(res, Err(Ok(Error::IntervalNotElapsed)));
 }
 
+/// A failed attempt does not count as a payment or restart the billing interval.
+#[test]
+fn test_insufficient_balance_preserves_last_payment_timestamp() {
+    let (env, client, _token, token_admin) = setup_test_env();
+    let interval: u64 = 300;
+    let subscriber = Address::generate(&env);
+    let merchant = Address::generate(&env);
+
+    let id = client.create_subscription(
+        &subscriber,
+        &merchant,
+        &AMOUNT,
+        &interval,
+        &false,
+        &None::<i128>,
+        &None::<u64>,
+        &None::<u32>,
+    );
+    token_admin.mint(&subscriber, &AMOUNT);
+
+    let due_at = T0 + interval;
+    env.ledger().with_mut(|l| l.timestamp = due_at);
+    let failed = client.try_charge_subscription(&id, &None::<soroban_sdk::BytesN<32>>);
+    assert_eq!(failed, Ok(Ok(ChargeExecutionResult::InsufficientBalance)));
+    assert_eq!(client.get_subscription(&id).last_payment_timestamp, T0);
+
+    client.deposit_funds(&id, &AMOUNT, &None::<soroban_sdk::BytesN<32>>);
+    let retry = client.try_charge_subscription(&id, &None::<soroban_sdk::BytesN<32>>);
+    assert_eq!(retry, Ok(Ok(ChargeExecutionResult::Charged)));
+    assert_eq!(client.get_subscription(&id).last_payment_timestamp, due_at);
+}
+
 /// After a successful charge at the boundary, the next charge at
 /// `new_last_payment + interval` must also succeed, confirming
 /// back-to-back charging at exact boundaries works.
