@@ -1007,6 +1007,10 @@ pub fn do_claim_admin_role(env: &Env, claimant: Address) -> Result<(), Error> {
         .get(&proposal_key(env))
         .ok_or(Error::ProposalNotFound)?;
 
+    if claimant != proposal.new_admin {
+        return Err(Error::InvalidClaimant);
+    }
+
     let now = env.ledger().timestamp();
     if now < proposal.proposed_at.saturating_add(ADMIN_PROPOSAL_COOLDOWN_SECS) {
         return Err(Error::ProposalCooldownActive);
@@ -1015,10 +1019,6 @@ pub fn do_claim_admin_role(env: &Env, claimant: Address) -> Result<(), Error> {
     if now > proposal.expires_at {
         storage.remove(&proposal_key(env));
         return Err(Error::ProposalExpired);
-    }
-
-    if claimant != proposal.new_admin {
-        return Err(Error::InvalidClaimant);
     }
 
     let old_admin: Address = require_admin(env)?;

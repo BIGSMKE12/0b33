@@ -144,10 +144,11 @@ fn test_claim_admin_role_wrong_claimant() {
     let new_admin = Address::generate(&env);
 
     client.propose_admin(&admin, &new_admin);
-    advance_seconds(&env, 24 * 60 * 60);
     let impostor = Address::generate(&env);
     let result = client.try_claim_admin_role(&impostor);
     assert_eq!(result, Err(Ok(Error::InvalidClaimant)));
+    assert_eq!(client.get_admin(), admin);
+    assert_eq!(client.get_admin_proposal().unwrap().new_admin, new_admin);
 }
 
 #[test]
