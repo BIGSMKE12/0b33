@@ -97,6 +97,31 @@ entire transaction reverts atomically.
 The topic contains the token address as the third element so indexers can efficiently
 filter withdrawal events per token without decoding the payload.
 
+## Scheduled Payout Behavior
+
+`flush_payouts(merchant)` implements automatic payout scheduling:
+
+1. Reads `PayoutSchedule[(merchant)]` (cadence_seconds, min_payout, last_payout_at).
+2. If no schedule is set (cadence_seconds == 0 and min_payout == 0), returns 0 (no-op).
+3. Checks cadence eligibility: `now >= last_payout_at + cadence_seconds`.
+   - If cadence is not elapsed, returns `Error::IntervalNotElapsed`.
+4. Iterates over all tokens in `MerchantTokens[(merchant)]`.
+5. For each token:
+   - Reads `MerchantBalance[(merchant, token)]`.
+   - **If balance is zero, skips the token** (no transfer, no event, no withdrawal record).
+   - If balance < min_payout, skips the token.
+   - Otherwise, calls `flush_merchant_token(merchant, token, payout_address, balance)`.
+6. Updates `last_payout_at` to current timestamp.
+7. Emits `ScheduledPayoutEvent` with the count of tokens successfully paid.
+8. Returns the count of tokens paid.
+
+**Zero-Balance Behavior**: When a merchant's earned balance for a token is exactly zero,
+the scheduled payout logic silently skips that token. No transfer is attempted, no
+withdrawal record is created, and the token is not counted in the payout event. This
+prevents unnecessary on-chain operations and ensures that only meaningful payouts are
+processed. If all tokens have zero balance, `flush_payouts` returns 0 and no
+`ScheduledPayoutEvent` is emitted.
+
 ## Refund Behavior
 
 `merchant_refund(merchant, subscriber, token, amount)`:
