@@ -1,7 +1,7 @@
 extern crate std;
 
 use crate::{
-    SubscriptionStatus, SubscriptionVault, SubscriptionVaultClient,
+    Error, SubscriptionStatus, SubscriptionVault, SubscriptionVaultClient,
 };
 use soroban_sdk::{
     testutils::{Address as _, Ledger as _},
@@ -376,4 +376,70 @@ fn test_identity_collision_subscriber_is_merchant() {
     
     let sub = client.get_subscription(&sub_id);
     assert_eq!(sub.status, SubscriptionStatus::Paused);
+}
+
+// ── Focused fuzz: `cancel_subscription` by a third-party address ────────────
+
+/// A third-party address — neither the subscriber nor the merchant — must never
+/// be able to cancel a subscription, whichever random address is drawn.
+///
+/// The authorization matrix above exercises `Operation::CancelSubscription` with
+/// the single fixed `Role::Stranger` address. This dedicated case sweeps many
+/// freshly generated third-party addresses and, because each one is authorized
+/// for the call, it pins the contract's own ownership check rather than the host
+/// auth layer. The documented rejection for a non-owner authorizer is
+/// `Error::Forbidden` (1002), matching `cancel_subscription_wrong_authorizer` in
+/// `test_require_auth.rs` and `docs/admin_authorization_matrix.md`.
+#[test]
+fn test_cancel_subscription_by_third_party_fuzz() {
+    for round in 0..32 {
+        let harness = FuzzHarness::setup();
+        let id = harness.subscription_id;
+
+        // Fresh random address: by construction it is neither the subscriber nor
+        // the merchant of this subscription.
+        let third_party = Address::generate(&harness.env);
+        assert_ne!(third_party, harness.subscriber);
+        assert_ne!(third_party, harness.merchant);
+
+        // Authorize exactly the third party for this call so the host auth layer
+        // is satisfied and the rejection must come from the contract's ownership
+        // check itself.
+        let args: SorobanVec<Val> = (id, third_party.clone()).into_val(&harness.env);
+        harness.env.mock_auths(&[soroban_sdk::testutils::MockAuth {
+            address: &third_party,
+            invoke: &soroban_sdk::testutils::MockAuthInvoke {
+                contract: &harness.client.address,
+                fn_name: "cancel_subscription",
+                args,
+                sub_invokes: &[],
+            },
+        }]);
+
+        let outcome = harness.client.try_cancel_subscription(&id, &third_party);
+        assert_eq!(
+            outcome,
+            Err(Ok(Error::Forbidden)),
+            "third-party cancel must be rejected with Forbidden (1002) (round {round})"
+        );
+
+        // A rejected cancel must leave the subscription completely untouched:
+        // still Active, no refund paid out.
+        assert_eq!(
+            harness.client.get_subscription(&id).status,
+            SubscriptionStatus::Active,
+            "a rejected third-party cancel must not mutate state (round {round})"
+        );
+    }
+
+    // And a third party that signs nothing at all is still rejected: the call
+    // cannot even reach the ownership check without the caller's own auth.
+    let harness = FuzzHarness::setup();
+    let id = harness.subscription_id;
+    let third_party = Address::generate(&harness.env);
+    harness.env.mock_auths(&[]);
+    assert!(
+        harness.client.try_cancel_subscription(&id, &third_party).is_err(),
+        "an unauthenticated third party must not be able to cancel"
+    );
 }
