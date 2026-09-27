@@ -975,11 +975,26 @@ pub fn do_propose_admin(env: &Env, current_admin: Address, new_admin: Address) -
     }
 
     let storage = env.storage().instance();
-    if storage.has(&proposal_key(env)) {
-        return Err(Error::ProposalAlreadyExists);
+    let now = env.ledger().timestamp();
+
+    // A pending proposal only blocks a replacement while it is still inside its
+    // `PROPOSAL_WINDOW_SECS` window. `do_claim_admin_role` refuses anything past
+    // `expires_at`, so once the window has elapsed the stored proposal is dead:
+    // it can never be claimed again. Leaving it in place would keep returning
+    // `ProposalAlreadyExists` forever and force the admin to call
+    // `cancel_admin_proposal` before they could ever rotate again — which is not
+    // what `docs/admin_rotation.md` promises ("a second propose_admin fails with
+    // ProposalAlreadyExists until the first is claimed, cancelled, or expires").
+    //
+    // An expired proposal is therefore treated as absent and overwritten. The
+    // boundary is `now <= expires_at` so that this agrees exactly with the
+    // claim-side guard, which rejects on `now > expires_at`.
+    if let Some(pending) = storage.get::<_, AdminProposal>(&proposal_key(env)) {
+        if now <= pending.expires_at {
+            return Err(Error::ProposalAlreadyExists);
+        }
     }
 
-    let now = env.ledger().timestamp();
     let proposal = AdminProposal {
         new_admin: new_admin.clone(),
         proposed_at: now,

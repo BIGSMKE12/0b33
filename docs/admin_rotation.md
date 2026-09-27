@@ -187,12 +187,20 @@ only after a 24-hour cooldown has elapsed since the proposal was created
 
 | Step | Rejects with |
 |------|---------------|
-| `propose_admin` | `Unauthorized` (caller is not the stored admin), `InvalidNewAdmin` (`new_admin == contract address`), `ProposalAlreadyExists` (a proposal is already pending) |
+| `propose_admin` | `Unauthorized` (caller is not the stored admin), `InvalidNewAdmin` (`new_admin == contract address`), `ProposalAlreadyExists` (a proposal is already pending *and still inside its window* — an expired one is replaced) |
 | `claim_admin_role` | `ProposalNotFound`, `ProposalCooldownActive` (within 24 h of the proposal), `ProposalExpired` (also clears the stale proposal), `InvalidClaimant` (not the proposed address) |
 | `cancel_admin_proposal` | `Unauthorized` (caller is not the stored admin), `NoActiveProposal` (nothing pending) |
 
-Only one proposal can exist at a time — a second `propose_admin` fails with
-`ProposalAlreadyExists` until the first is claimed, cancelled, or expires.
+Only one *claimable* proposal can exist at a time — a second `propose_admin`
+fails with `ProposalAlreadyExists` until the first is claimed, cancelled, or
+expires. An expired proposal is dead: it can never be claimed again, so
+`propose_admin` treats it as absent and overwrites it with a fresh proposal
+(and a fresh 7-day window) rather than returning `ProposalAlreadyExists`
+forever and forcing the admin to cancel first.
+
+The boundary is inclusive on the claim side: a proposal whose
+`expires_at == ledger.timestamp()` is still claimable, and it is only replaced
+once `ledger.timestamp() > expires_at`.
 
 ### Rollback: the new admin key is compromised *before* acceptance
 

@@ -194,6 +194,29 @@ The following operations require administrator authorization:
 - **Coverage**: Event emission for observability
 - **Expected Behavior**: Events are emitted during rotation
 
+### Admin Proposal Expiry Tests
+
+`tests/admin_proposal_expiry.rs` covers the two-step rotation proposal's expiry
+window (`PROPOSAL_WINDOW_SECS`, 7 days) end to end. It lives under `tests/`
+rather than in `src/` because the `src/test_*.rs` files are not `mod`-declared
+by `lib.rs`, so `cargo test --all` never compiles them.
+
+- **Window stored**: `propose_admin` persists `expires_at = proposed_at + 7 days`
+  and announces it in `AdminProposalCreatedEvent` — 2 tests
+- **Claim boundary**: a claim settles inside the window and at exactly
+  `expires_at`, and is rejected with `ProposalExpired` one second later — 3 tests
+- **Stale cleanup**: a refused expired claim drops the proposal and leaves the
+  stored admin untouched, and reads never mutate — 3 tests
+- **Blocking**: a claimable proposal still blocks re-proposal with
+  `ProposalAlreadyExists`, including at exactly `expires_at` — 2 tests
+- **Re-proposal after expiry**: the stale proposal no longer blocks
+  `propose_admin`; the replacement carries a refreshed window and its own
+  `admin_proposal_created` event, the stale claimant can no longer claim
+  (`InvalidClaimant`), and the replacement can complete the rotation — 6 tests
+- **Cancellation**: `cancel_admin_proposal` still clears the way — 2 tests
+- **Constants and codes**: the window/cooldown durations and the
+  `Proposal*` error codes are pinned — 2 tests
+
 ## Test Statistics
 
 - **Total Admin Rotation Tests**: 19
