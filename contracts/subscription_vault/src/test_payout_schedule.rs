@@ -413,3 +413,154 @@ fn test_get_payout_schedule_default() {
     assert_eq!(schedule.min_payout, 0);
     assert_eq!(schedule.last_payout_at, 0);
 }
+
+// ══════════════════════════════════════════════════════════════════════════════
+// Payout Schedule with Zero Earned Balance
+//
+// Tests the behavior when a merchant has earned_balance = 0. Scheduling a payout
+// of zero should be handled gracefully. The current implementation skips tokens
+// with zero balance during flush_payouts, which is the correct behavior.
+//
+// This test verifies:
+// - Zero-balance merchants do not trigger any payout
+// - No transfer attempts are made for zero amounts
+// - No events are emitted for zero payouts
+// - flush_payouts returns 0 (no tokens paid)
+// ══════════════════════════════════════════════════════════════════════════════
+
+#[test]
+fn test_flush_payouts_with_zero_earned_balance() {
+    let (env, client, _admin, token) = setup_env();
+    let contract_id = client.address.clone();
+    let merchant = Address::generate(&env);
+    let payout = Address::generate(&env);
+    initialize_merchant_config(&client, &merchant, &payout);
+
+    // Set a schedule with cadence=1 (always eligible) and zero min_payout
+    client.set_payout_schedule(&merchant, &1, &0);
+
+    // Seed merchant with ZERO balance (but register the token so it is iterated)
+    seed_merchant_balance_and_token(&env, &contract_id, &merchant, &token, 0);
+    seed_merchant_earnings(&env, &contract_id, &merchant, &token, 0);
+
+    // Do NOT mint any tokens to the contract — balance is truly zero
+
+    // Flush payouts should return 0 (no tokens paid)
+    let count = client.flush_payouts(&merchant);
+    assert_eq!(count, 0, "flush_payouts should return 0 for zero balance");
+
+    // Verify merchant balance is still 0
+    assert_eq!(client.get_merchant_balance_by_token(&merchant, &token), 0);
+
+    // Verify payout address received nothing
+    assert_eq!(
+        token::Client::new(&env, &token).balance(&payout),
+        0,
+        "payout address should not receive any funds"
+    );
+
+    // Verify no ScheduledPayoutEvent was emitted
+    let events = env.events().all();
+    let has_scheduled_payout_event = events.iter().any(|(contract, topic, _val)| {
+        *contract == contract_id
+            && Symbol::from_val(&env, &topic.get(0).unwrap()) == Symbol::new(&env, "scheduled_payout")
+    });
+    assert!(
+        !has_scheduled_payout_event,
+        "No scheduled_payout event should be emitted for zero balance"
+    );
+}
+
+#[test]
+fn test_flush_payouts_skips_multiple_zero_balance_tokens() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(SubscriptionVault, ());
+    let client = SubscriptionVaultClient::new(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    let token_a = env
+        .register_stellar_asset_contract_v2(admin.clone())
+        .address();
+    let token_b = env
+        .register_stellar_asset_contract_v2(admin.clone())
+        .address();
+    let token_c = env
+        .register_stellar_asset_contract_v2(admin.clone())
+        .address();
+
+    client.init(&token_a, &6, &admin, &1_000_000i128, &(7 * 24 * 60 * 60));
+    client.add_accepted_token(&admin, &token_b, &6);
+    client.add_accepted_token(&admin, &token_c, &6);
+
+    let merchant = Address::generate(&env);
+    let payout = Address::generate(&env);
+    initialize_merchant_config(&client, &merchant, &payout);
+
+    client.set_payout_schedule(&merchant, &1, &0);
+
+    // Seed merchant with zero balance for all three tokens
+    seed_merchant_balance_and_token(&env, &contract_id, &merchant, &token_a, 0);
+    seed_merchant_balance_and_token(&env, &contract_id, &merchant, &token_b, 0);
+    seed_merchant_balance_and_token(&env, &contract_id, &merchant, &token_c, 0);
+    seed_merchant_earnings(&env, &contract_id, &merchant, &token_a, 0);
+    seed_merchant_earnings(&env, &contract_id, &merchant, &token_b, 0);
+    seed_merchant_earnings(&env, &contract_id, &merchant, &token_c, 0);
+
+    // Flush payouts should return 0 (no tokens paid)
+    let count = client.flush_payouts(&merchant);
+    assert_eq!(count, 0, "flush_payouts should return 0 when all balances are zero");
+
+    // Verify all balances remain zero
+    assert_eq!(client.get_merchant_balance_by_token(&merchant, &token_a), 0);
+    assert_eq!(client.get_merchant_balance_by_token(&merchant, &token_b), 0);
+    assert_eq!(client.get_merchant_balance_by_token(&merchant, &token_c), 0);
+}
+
+#[test]
+fn test_flush_payouts_skips_zero_balance_but_pays_nonzero() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(SubscriptionVault, ());
+    let client = SubscriptionVaultClient::new(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    let token_a = env
+        .register_stellar_asset_contract_v2(admin.clone())
+        .address();
+    let token_b = env
+        .register_stellar_asset_contract_v2(admin.clone())
+        .address();
+
+    client.init(&token_a, &6, &admin, &1_000_000i128, &(7 * 24 * 60 * 60));
+    client.add_accepted_token(&admin, &token_b, &6);
+
+    let merchant = Address::generate(&env);
+    let payout = Address::generate(&env);
+    initialize_merchant_config(&client, &merchant, &payout);
+
+    client.set_payout_schedule(&merchant, &1, &0);
+
+    let bal_a: i128 = 0; // zero balance
+    let bal_b: i128 = 5_000_000; // nonzero balance
+
+    seed_merchant_balance_and_token(&env, &contract_id, &merchant, &token_a, bal_a);
+    seed_merchant_balance_and_token(&env, &contract_id, &merchant, &token_b, bal_b);
+    seed_merchant_earnings(&env, &contract_id, &merchant, &token_a, bal_a);
+    seed_merchant_earnings(&env, &contract_id, &merchant, &token_b, bal_b);
+    token::StellarAssetClient::new(&env, &token_b).mint(&contract_id, &bal_b);
+
+    // Flush payouts should return 1 (only token_b paid)
+    let count = client.flush_payouts(&merchant);
+    assert_eq!(count, 1, "flush_payouts should return 1 (only token_b paid)");
+
+    // Verify token_a balance is still 0 (not paid)
+    assert_eq!(client.get_merchant_balance_by_token(&merchant, &token_a), 0);
+
+    // Verify token_b balance is now 0 (paid out)
+    assert_eq!(client.get_merchant_balance_by_token(&merchant, &token_b), 0);
+
+    // Verify payout address received only token_b funds
+    assert_eq!(token::Client::new(&env, &token_a).balance(&payout), 0);
+    assert_eq!(token::Client::new(&env, &token_b).balance(&payout), bal_b);
+}
