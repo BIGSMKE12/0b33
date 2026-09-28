@@ -15,8 +15,6 @@
 .deploy-state
 
 # Environment and secrets
-.env
-.env.*
 !.env.example
 *.key
 *.pem
@@ -32,9 +30,9 @@ Thumbs.db
 # Windows executables (e.g., rustup-init.exe)
 *.exe
 
+temp_auto_push.bat
 # IDE / Editor
 .idea/
-.vscode/
 *.swp
 *.swo
 *~
@@ -67,3 +65,7 @@ tarpaulin-report.html
 test_snapshots/
 **/test_snapshots/
 .coverage
+.gitignore
+branch_structure.json
+config.bat
+node_modules
