@@ -4353,6 +4353,28 @@ fn test_list_subscriptions_by_subscriber_limit_zero_errors() {
 }
 
 #[test]
+fn test_list_subscriptions_by_subscriber_rejects_cursor_past_max_id() {
+    let test_env = TestEnv::default();
+    let subscriber = Address::generate(&test_env.env);
+    let merchant = Address::generate(&test_env.env);
+    test_env.client.create_subscription(
+        &subscriber,
+        &merchant,
+        &AMOUNT,
+        &INTERVAL,
+        &false,
+        &None::<i128>,
+        &None::<u64>,
+        &None::<u32>,
+    );
+
+    let result = test_env
+        .client
+        .try_list_subscriptions_by_subscriber(&subscriber, &1, &10);
+    assert!(matches!(result, Err(Ok(Error::InvalidInput))));
+}
+
+#[test]
 fn test_list_subscriptions_by_subscriber_pagination_stable_ordering() {
     let test_env = TestEnv::default();
     let subscriber = Address::generate(&test_env.env);

@@ -482,6 +482,11 @@ pub fn list_subscriptions_by_subscriber(
         return Err(Error::InvalidExportLimit);
     }
 
+    let next_id: u32 = crate::admin::read_config(env, &DataKey::NextId).unwrap_or(0);
+    if (next_id == 0 && start_from_id > 0) || (next_id > 0 && start_from_id >= next_id) {
+        return Err(Error::InvalidInput);
+    }
+
     let index: Vec<u32> = env
         .storage()
         .instance()
