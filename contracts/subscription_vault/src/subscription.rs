@@ -520,6 +520,7 @@ pub fn do_create_subscription(
     sub_account_label: Option<Symbol>,
     proration_enabled: bool,
 ) -> Result<u32, Error> {
+    crate::validation::validate_subscription_amount(amount)?;
     let token = crate::admin::get_token(env)?;
 
     // Enforce subscriber-level credit limit for this token before creating a new
@@ -557,6 +558,7 @@ pub fn do_create_subscription_with_token(
     proration_enabled: bool,
 ) -> Result<u32, Error> {
     subscriber.require_auth();
+    crate::validation::validate_subscription_amount(amount)?;
 
     crate::blocklist::require_not_blocklisted(env, &subscriber)?;
     crate::blocklist::require_not_blocklisted(env, &merchant)?;
@@ -593,13 +595,6 @@ pub fn do_create_subscription_with_token(
             },
         );
         return Err(Error::MaxConcurrentSubscriptionsReached);
-    }
-
-    if amount < 0 {
-        return Err(Error::InvalidAmount);
-    }
-    if amount == 0 {
-        return Err(Error::InvalidAmount);
     }
 
     validate_interval(interval_seconds)?;
@@ -3217,6 +3212,7 @@ pub fn do_create_plan_template(
 ) -> Result<u32, Error> {
     merchant.require_auth();
 
+    crate::validation::validate_subscription_amount(amount)?;
     validate_interval(interval_seconds)?;
 
     // Validate lifetime_cap if provided
@@ -3271,6 +3267,7 @@ pub fn do_create_plan_template_with_token(
     lifetime_cap: Option<i128>,
 ) -> Result<u32, Error> {
     merchant.require_auth();
+    crate::validation::validate_subscription_amount(amount)?;
     validate_interval(interval_seconds)?;
     if !crate::admin::is_token_accepted(env, &token) {
         return Err(Error::InvalidInput);
@@ -3327,6 +3324,7 @@ pub fn do_create_subscription_from_plan(
     enforce_creation_rate_limit(env, &subscriber)?;
 
     let plan = get_plan_template(env, plan_template_id)?;
+    crate::validation::validate_subscription_amount(plan.amount)?;
 
     if plan.is_disabled {
         return Err(Error::InvalidInput);
@@ -3462,6 +3460,7 @@ pub fn do_update_plan_template(
 ) -> Result<u32, Error> {
     merchant.require_auth();
 
+    crate::validation::validate_subscription_amount(amount)?;
     validate_interval(interval_seconds)?;
 
     // Validate lifetime_cap if provided
@@ -3587,6 +3586,7 @@ pub fn do_migrate_subscription_to_plan(
 
     let current_plan = get_plan_template(env, current_plan_id)?;
     let new_plan = get_plan_template(env, new_plan_template_id)?;
+    crate::validation::validate_subscription_amount(new_plan.amount)?;
 
     // Enforce migration within the same logical template family.
     if current_plan.template_key != new_plan.template_key {

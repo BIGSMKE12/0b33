@@ -57,6 +57,7 @@ mod types;
 mod validation;
 
 pub use admin::CONFIG_COOLDOWN_SECS;
+pub use validation::MAX_SUBSCRIPTION_AMOUNT;
 pub use safe_math::*;
 // Re-export pure helpers needed by Kani harnesses.  Gated so they are not
 // part of the normal ABI or WASM build.

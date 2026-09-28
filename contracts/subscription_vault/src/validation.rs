@@ -31,6 +31,17 @@ use crate::types::Error;
 /// Minimum printable, non-whitespace length for String arguments.
 const MIN_STRING_LEN: u32 = 1;
 
+/// Maximum interval charge amount that can be safely multiplied by fee basis points.
+pub const MAX_SUBSCRIPTION_AMOUNT: i128 = i128::MAX / crate::types::MAX_FEE_BIPS as i128;
+
+/// Reject interval charge amounts whose fee calculation could overflow.
+pub fn validate_subscription_amount(amount: i128) -> Result<(), Error> {
+    if amount <= 0 || amount > MAX_SUBSCRIPTION_AMOUNT {
+        return Err(Error::InvalidAmount);
+    }
+    Ok(())
+}
+
 /// Reject an empty or whitespace-only Soroban `String`.
 ///
 /// # Errors
