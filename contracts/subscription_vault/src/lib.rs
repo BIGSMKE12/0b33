@@ -3138,6 +3138,22 @@ impl SubscriptionVault {
         queries::query_prepaid_balances_paginated(&env, request)
     }
 
+    /// Set the idempotency-key lifetime in seconds. Admin only.
+    pub fn set_idempotency_ttl(
+        env: Env,
+        admin: Address,
+        ttl_secs: u64,
+    ) -> Result<(), Error> {
+        require_admin_auth(&env, &admin)?;
+        admin::enforce_config_cooldown(&env, "IdempotencyTtl")?;
+        idempotency::set_ttl_secs(&env, ttl_secs)
+    }
+
+    /// Get the configured idempotency-key lifetime in seconds.
+    pub fn get_idempotency_ttl(env: Env) -> u64 {
+        idempotency::get_ttl_secs(&env)
+    }
+
     /// Set billing retention. Admin only.
     pub fn set_billing_retention(env: Env, admin: Address, keep_recent: u32) -> Result<(), Error> {
         require_admin_auth(&env, &admin)?;
