@@ -107,7 +107,7 @@ pub const ORACLE_PRICE_INVALID_CODE: u32 = 3007;
 /// Ring buffer for subscription-scoped idempotency hashes.
 ///
 /// Each entry is `(hash, inserted_at_timestamp)`.  Entries older than
-/// `idempotency::IDEM_TTL_SECS` are treated as expired on lookup.
+/// the configured idempotency TTL are treated as expired on lookup.
 #[contracttype]
 #[derive(Clone, Debug)]
 pub struct IdemRingBuffer {

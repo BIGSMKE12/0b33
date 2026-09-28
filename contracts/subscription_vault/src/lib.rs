@@ -53,6 +53,8 @@ mod subscription;
 mod test_datakey_layout;
 #[cfg(test)]
 mod test_merchant_tags;
+#[cfg(test)]
+mod test_idempotency_keys;
 mod types;
 mod validation;
 
@@ -3134,6 +3136,22 @@ impl SubscriptionVault {
         request: PrepaidQueryRequest,
     ) -> PrepaidQueryResult {
         queries::query_prepaid_balances_paginated(&env, request)
+    }
+
+    /// Set the idempotency-key lifetime in seconds. Admin only.
+    pub fn set_idempotency_ttl(
+        env: Env,
+        admin: Address,
+        ttl_secs: u64,
+    ) -> Result<(), Error> {
+        require_admin_auth(&env, &admin)?;
+        admin::enforce_config_cooldown(&env, "IdempotencyTtl")?;
+        idempotency::set_ttl_secs(&env, ttl_secs)
+    }
+
+    /// Get the configured idempotency-key lifetime in seconds.
+    pub fn get_idempotency_ttl(env: Env) -> u64 {
+        idempotency::get_ttl_secs(&env)
     }
 
     /// Set billing retention. Admin only.

@@ -1,5 +1,8 @@
 use crate::{
-    idempotency::{check_key, check_key_at, hash_idem_key, push_key, IDEM_HISTORY, IDEM_TTL_SECS},
+    idempotency::{
+        check_key, check_key_at, hash_idem_key, push_key, IdemRingBuffer, IDEM_HISTORY,
+        IDEM_TTL_SECS,
+    },
     ChargeExecutionResult, SubscriptionVault, SubscriptionVaultClient,
 };
 use soroban_sdk::{
@@ -437,7 +440,7 @@ fn test_idem_ring_exact_capacity_then_overwrite() {
     );
 }
 
-/// Time-based expiry: an entry older than `IDEM_TTL_SECS` must no longer
+/// Time-based expiry: an entry older than the default `IDEM_TTL_SECS` must no longer
 /// be considered a duplicate, even if the ring has not cycled.
 ///
 /// This closes the ring-cycling attack (issue #13): an attacker cannot
@@ -493,7 +496,57 @@ fn test_idem_ttl_expires_old_entries() {
     );
 }
 
-/// Verify that the combined TTL + ring-size defence makes the cycling attack
+#[test]
+fn test_idempotency_ttl_is_configurable_and_prunes_on_write() {
+    let (env, client, token) = setup_test_env();
+    let subscriber = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let id = create_and_fund_sub(&env, &client, &subscriber, &merchant, &token);
+    let token_admin = token::StellarAssetClient::new(&env, &token);
+    token_admin.mint(&subscriber, &2_000_000i128);
+
+    assert_eq!(client.get_idempotency_ttl(), IDEM_TTL_SECS);
+    let admin = client.get_admin();
+    assert_eq!(
+        client.try_set_idempotency_ttl(&admin, &0),
+        Err(Ok(crate::Error::InvalidInput))
+    );
+
+    let configured_ttl = 10u64;
+    client.set_idempotency_ttl(&admin, &configured_ttl);
+    assert_eq!(client.get_idempotency_ttl(), configured_ttl);
+
+    let domain = crate::nonce::DOMAIN_DEPOSIT_FUNDS.as_u32();
+    let first_key = make_key(&env, 0xA1);
+    let first_hash = hash_idem_key(&env, domain, id, &first_key);
+    client.deposit_funds(&id, &500_000i128, &Some(first_key));
+
+    let now = env.ledger().timestamp();
+    env.ledger().set_timestamp(now + configured_ttl);
+
+    let second_key = make_key(&env, 0xA2);
+    let second_hash = hash_idem_key(&env, domain, id, &second_key);
+    client.deposit_funds(&id, &500_000i128, &Some(second_key));
+
+    let buffer: IdemRingBuffer = env.as_contract(&client.address, || {
+        env.storage()
+            .instance()
+            .get(&crate::types::DataKey::IdemKey(id))
+            .unwrap()
+    });
+    assert_eq!(buffer.entries.len(), 1);
+    assert_eq!(buffer.entries.get(0).unwrap().0, second_hash);
+    assert!(!check_key(&env, id, &first_hash));
+    assert!(check_key(&env, id, &second_hash));
+
+    let attacker = Address::generate(&env);
+    assert_eq!(
+        client.try_set_idempotency_ttl(&attacker, &configured_ttl),
+        Err(Ok(crate::Error::Forbidden))
+    );
+}
+
+/// Verify that the default TTL + ring-size defence makes the cycling attack
 /// infeasible: filling 64 slots within 7 days requires a charge every ~2.6
 /// hours — far above any normal subscription billing cadence.
 ///
