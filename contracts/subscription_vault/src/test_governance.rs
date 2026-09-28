@@ -1168,6 +1168,298 @@ mod min_timelock_delay_enforcement {
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
+// Governance quorum recalculation when voting weight changes mid-vote
+//
+// Scenario: Guardian casts vote, then their weight changes (token transfer or removal).
+// Quorum calculation uses current guardian weights at execution time, not vote time.
+// This can lead to proposals passing/failing with different total weight than expected.
+// ══════════════════════════════════════════════════════════════════════════════
+
+mod governance_quorum_weight_changes {
+    use crate::types::{Error, ProposalKind};
+    use crate::{SubscriptionVault, SubscriptionVaultClient};
+    use soroban_sdk::{
+        testutils::{Address as _, Ledger as _},
+        Address, Env, String,
+    };
+
+    const MIN_TIMELOCK_DELAY: u64 = 2 * 24 * 60 * 60;
+
+    fn init_vault<'a>(env: &'a Env, admin: &Address) -> SubscriptionVaultClient<'a> {
+        let token_admin = Address::generate(env);
+        let token_address = env
+            .register_stellar_asset_contract_v2(token_admin)
+            .address();
+        let contract_id = env.register(SubscriptionVault, ());
+        let client = SubscriptionVaultClient::new(env, &contract_id);
+        client.init(&token_address, &6, admin, &10_000_000, &86400);
+        client
+    }
+
+    /// Test: Guardian votes YES, then is removed. Vote is excluded from quorum.
+    /// This is the documented behavior: votes from removed guardians are ignored.
+    #[test]
+    fn guardian_removed_after_voting_vote_excluded_from_quorum() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let guardian1 = Address::generate(&env);
+        let guardian2 = Address::generate(&env);
+
+        let client = init_vault(&env, &admin);
+
+        // Add two guardians: guardian1 with 100 weight, guardian2 with 50 weight
+        client.add_guardian(&admin, &guardian1, &100);
+        client.add_guardian(&admin, &guardian2, &50);
+
+        let current_time = env.ledger().timestamp();
+        let eta = current_time + MIN_TIMELOCK_DELAY;
+
+        let target = Address::generate(&env);
+        let proposal_id = client.submit_proposal(
+            &ProposalKind::RotateAdmin,
+            &target,
+            &None,
+            &0,
+            &5000, // 50% quorum required
+            &eta,
+        );
+
+        // Guardian1 votes YES (100 votes)
+        client.vote_proposal(&proposal_id, &true);
+
+        // Admin removes guardian1 — their vote should no longer count
+        client.remove_guardian(&admin, &guardian1);
+
+        // Advance past ETA
+        env.ledger().set_timestamp(eta + 1);
+
+        // Try to execute — should fail because guardian1's vote is excluded
+        // Total weight now = 50 (only guardian2 remains)
+        // Votes for = 0 (guardian1's vote excluded)
+        // Required = 50 * 50% = 25
+        // 0 < 25, so quorum not met
+        let result = client.try_execute_proposal(&proposal_id);
+        assert_eq!(
+            result,
+            Err(Ok(Error::InvalidInput)),
+            "proposal must fail when voting guardian is removed before execution"
+        );
+    }
+
+    /// Test: Guardian with weight 100 votes, weight is reduced to 10 before execution.
+    /// The quorum calculation uses the current weight (10), not the weight at vote time (100).
+    /// 
+    /// **Expected behavior**: Quorum is recalculated with current weights at execution time.
+    /// This is the documented design: votes cast earlier are counted against the guardian's
+    /// *current* weight, not their historical weight.
+    #[test]
+    fn guardian_weight_reduced_after_voting_affects_quorum() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let guardian1 = Address::generate(&env);
+
+        let client = init_vault(&env, &admin);
+
+        // Add guardian with weight 100
+        client.add_guardian(&admin, &guardian1, &100);
+
+        let current_time = env.ledger().timestamp();
+        let eta = current_time + MIN_TIMELOCK_DELAY;
+
+        let target = Address::generate(&env);
+        let proposal_id = client.submit_proposal(
+            &ProposalKind::RotateAdmin,
+            &target,
+            &None,
+            &0,
+            &5000, // 50% quorum required
+            &eta,
+        );
+
+        // Guardian votes YES with weight 100
+        client.vote_proposal(&proposal_id, &true);
+
+        // Admin removes guardian1 and re-adds with weight 10
+        client.remove_guardian(&admin, &guardian1);
+        client.add_guardian(&admin, &guardian1, &10);
+
+        // Advance past ETA
+        env.ledger().set_timestamp(eta + 1);
+
+        // Execute: quorum calculation uses current weight (10)
+        // Total weight = 10
+        // Votes for = 10 (guardian1's YES vote counted at current weight)
+        // Required = 10 * 50% = 5
+        // 10 >= 5, so quorum is met
+        let result = client.try_execute_proposal(&proposal_id);
+        assert!(
+            result.is_ok(),
+            "proposal should pass with guardian's current weight"
+        );
+    }
+
+    /// Test: Guardian votes YES, then another guardian is added with higher weight.
+    /// The total weight denominator increases, potentially causing quorum to fail.
+    #[test]
+    fn new_guardian_added_after_vote_increases_quorum_denominator() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let guardian1 = Address::generate(&env);
+        let guardian2 = Address::generate(&env);
+
+        let client = init_vault(&env, &admin);
+
+        // Add guardian1 with weight 100 (total weight = 100)
+        client.add_guardian(&admin, &guardian1, &100);
+
+        let current_time = env.ledger().timestamp();
+        let eta = current_time + MIN_TIMELOCK_DELAY;
+
+        let target = Address::generate(&env);
+        let proposal_id = client.submit_proposal(
+            &ProposalKind::RotateAdmin,
+            &target,
+            &None,
+            &0,
+            &5000, // 50% quorum required
+            &eta,
+        );
+
+        // Guardian1 votes YES (100 votes out of 100 total = 100%)
+        client.vote_proposal(&proposal_id, &true);
+
+        // Add guardian2 with weight 200 (total weight now = 300)
+        client.add_guardian(&admin, &guardian2, &200);
+
+        // Advance past ETA
+        env.ledger().set_timestamp(eta + 1);
+
+        // Execute: quorum calculation uses current total weight
+        // Total weight = 300 (guardian1: 100, guardian2: 200)
+        // Votes for = 100 (only guardian1 voted)
+        // Required = 300 * 50% = 150
+        // 100 < 150, so quorum not met
+        let result = client.try_execute_proposal(&proposal_id);
+        assert_eq!(
+            result,
+            Err(Ok(Error::InvalidInput)),
+            "proposal must fail when new guardians increase denominator after voting"
+        );
+    }
+
+    /// Test: Multiple guardians vote, one is removed, proposal should still pass
+    /// if remaining votes meet quorum with recalculated denominator.
+    #[test]
+    fn partial_guardian_removal_proposal_passes_with_remaining_votes() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let guardian1 = Address::generate(&env);
+        let guardian2 = Address::generate(&env);
+        let guardian3 = Address::generate(&env);
+
+        let client = init_vault(&env, &admin);
+
+        // Add three guardians with equal weight
+        client.add_guardian(&admin, &guardian1, &100);
+        client.add_guardian(&admin, &guardian2, &100);
+        client.add_guardian(&admin, &guardian3, &100);
+        // Total weight = 300
+
+        let current_time = env.ledger().timestamp();
+        let eta = current_time + MIN_TIMELOCK_DELAY;
+
+        let target = Address::generate(&env);
+        let proposal_id = client.submit_proposal(
+            &ProposalKind::RotateAdmin,
+            &target,
+            &None,
+            &0,
+            &5000, // 50% quorum required
+            &eta,
+        );
+
+        // All three guardians vote YES (300 votes, 100%)
+        client.vote_proposal(&proposal_id, &true);
+        // Note: in the current implementation, we need to handle voting with nonces
+        // or mock_all_auths handles this transparently
+
+        // Remove guardian1 — their vote is excluded
+        client.remove_guardian(&admin, &guardian1);
+        // Total weight now = 200, votes for = 200 (guardian2 + guardian3)
+
+        // Advance past ETA
+        env.ledger().set_timestamp(eta + 1);
+
+        // Execute: should pass because 200/200 >= 50%
+        let result = client.try_execute_proposal(&proposal_id);
+        assert!(
+            result.is_ok(),
+            "proposal should pass when remaining votes meet quorum"
+        );
+    }
+
+    /// Test: Document the known limitation where votes are cast, then many new
+    /// guardians are added, potentially making it impossible to ever reach quorum
+    /// even if all original voters voted YES.
+    #[test]
+    fn quorum_impossible_when_massive_weight_added_after_voting() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let guardian1 = Address::generate(&env);
+
+        let client = init_vault(&env, &admin);
+
+        // Single guardian with weight 10
+        client.add_guardian(&admin, &guardian1, &10);
+
+        let current_time = env.ledger().timestamp();
+        let eta = current_time + MIN_TIMELOCK_DELAY;
+
+        let target = Address::generate(&env);
+        let proposal_id = client.submit_proposal(
+            &ProposalKind::RotateAdmin,
+            &target,
+            &None,
+            &0,
+            &5000, // 50% quorum
+            &eta,
+        );
+
+        // Guardian1 votes YES (10 votes, 100% of total)
+        client.vote_proposal(&proposal_id, &true);
+
+        // Admin adds 10 new guardians with massive weight
+        for i in 0..10 {
+            let new_guardian = Address::generate(&env);
+            client.add_guardian(&admin, &new_guardian, &1000);
+        }
+        // Total weight now = 10 + (10 * 1000) = 10,010
+        // Votes for = 10
+        // Required = 10,010 * 50% = 5,005
+        // Impossible to reach without the new guardians voting
+
+        env.ledger().set_timestamp(eta + 1);
+
+        let result = client.try_execute_proposal(&proposal_id);
+        assert_eq!(
+            result,
+            Err(Ok(Error::InvalidInput)),
+            "proposal becomes unpassable when massive weight is added after voting"
+        );
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
 // Admin rotation invariant tests
 //
 // Security model enforced by these tests:

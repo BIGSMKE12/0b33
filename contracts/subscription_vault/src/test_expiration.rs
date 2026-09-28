@@ -429,6 +429,99 @@ fn test_rejected_expiration_writes_no_storage() {
     assert_eq!(res.unwrap(), 0, "first subscription should have id 0");
 }
 
+/// Charge at exactly the expiration boundary timestamp must be rejected.
+///
+/// This test verifies the boundary semantics documented in docs/expiration.md:
+/// - `timestamp >= expiration` means the subscription is expired (inclusive).
+/// - The boundary check is: `current_time >= expires_at`.
+///
+/// When `env.ledger().timestamp() == expiration`, the subscription must
+/// be considered expired and any charge attempt must return
+/// `Error::SubscriptionExpired`.
+#[test]
+fn test_charge_at_exact_expiration_boundary_rejected() {
+    let (env, client, token_client, token_admin, _) = setup_test_env();
+    let subscriber = Address::generate(&env);
+    let merchant = Address::generate(&env);
+
+    let amount = 1_000_000i128;
+    let expires_at = T0 + 2 * INTERVAL;
+    token_admin.mint(&subscriber, &(amount * 10));
+
+    let sub_id = client.create_subscription_with_token(
+        &subscriber,
+        &merchant,
+        &token_client.address,
+        &amount,
+        &INTERVAL,
+        &false,
+        &None::<i128>,
+        &Some(expires_at),
+        &None::<u32>,
+    );
+    client.deposit_funds(&sub_id, &(amount * 5), &None::<soroban_sdk::BytesN<32>>);
+
+    // Charge succeeds one second before expiration.
+    env.ledger().with_mut(|l| l.timestamp = expires_at - 1);
+    let res_before = client.try_charge_subscription(&sub_id, &None::<soroban_sdk::BytesN<32>>);
+    assert!(res_before.is_ok(), "charge one second before expiration must succeed");
+
+    // Charge at exact expiration boundary — must be rejected.
+    env.ledger().with_mut(|l| l.timestamp = expires_at);
+    let res_at = client.try_charge_subscription(&sub_id, &None::<soroban_sdk::BytesN<32>>);
+    assert_eq!(
+        res_at,
+        Err(Ok(Error::SubscriptionExpired)),
+        "charge at exact expiration boundary (timestamp == expires_at) must be rejected"
+    );
+
+    // Verify subscription transitioned to Expired status.
+    let sub = client.get_subscription(&sub_id);
+    assert_eq!(sub.status, SubscriptionStatus::Expired);
+}
+
+/// Deposit at exactly the expiration boundary timestamp must be rejected.
+///
+/// Verifies that `deposit_funds` respects the same boundary semantics as
+/// `charge_subscription`: when `timestamp >= expiration`, the operation
+/// is rejected with `Error::SubscriptionExpired`.
+#[test]
+fn test_deposit_at_exact_expiration_boundary_rejected() {
+    let (env, client, token_client, token_admin, _) = setup_test_env();
+    let subscriber = Address::generate(&env);
+    let merchant = Address::generate(&env);
+
+    let amount = 1_000_000i128;
+    let expires_at = T0 + INTERVAL;
+    token_admin.mint(&subscriber, &(amount * 10));
+
+    let sub_id = client.create_subscription_with_token(
+        &subscriber,
+        &merchant,
+        &token_client.address,
+        &amount,
+        &INTERVAL,
+        &false,
+        &None::<i128>,
+        &Some(expires_at),
+        &None::<u32>,
+    );
+
+    // Deposit one second before expiration — succeeds.
+    env.ledger().with_mut(|l| l.timestamp = expires_at - 1);
+    let res_before = client.try_deposit_funds(&sub_id, &amount, &None::<soroban_sdk::BytesN<32>>);
+    assert!(res_before.is_ok(), "deposit before expiration must succeed");
+
+    // Deposit at exact expiration boundary — rejected.
+    env.ledger().with_mut(|l| l.timestamp = expires_at);
+    let res_at = client.try_deposit_funds(&sub_id, &amount, &None::<soroban_sdk::BytesN<32>>);
+    assert_eq!(
+        res_at,
+        Err(Ok(Error::SubscriptionExpired)),
+        "deposit at exact expiration boundary must be rejected"
+    );
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Ledger-sequence expiration bound tests (#686)
 // ─────────────────────────────────────────────────────────────────────────────
