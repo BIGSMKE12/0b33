@@ -1,8 +1,9 @@
 use crate::{
     period_snapshots::{get_period_snapshot, list_period_snapshots, write_period_snapshot},
     types::{
-        BillingPeriodSnapshot, Error, SNAPSHOT_FLAG_CLOSED, SNAPSHOT_FLAG_EMPTY,
-        SNAPSHOT_FLAG_INTERVAL_CHARGED, SNAPSHOT_FLAG_USAGE_CHARGED,
+        BillingPeriodSnapshot, DataKey, Error, MAX_BILLING_PERIOD_SNAPSHOTS_PER_SUBSCRIPTION,
+        SNAPSHOT_FLAG_CLOSED, SNAPSHOT_FLAG_EMPTY, SNAPSHOT_FLAG_INTERVAL_CHARGED,
+        SNAPSHOT_FLAG_USAGE_CHARGED,
     },
     SubscriptionVault,
 };
@@ -67,6 +68,49 @@ fn test_list_period_snapshots_returns_latest_n() {
         assert_eq!(latest.get(0).unwrap().period_index, 4);
         assert_eq!(latest.get(1).unwrap().period_index, 3);
         assert_eq!(latest.get(2).unwrap().period_index, 2);
+    });
+}
+
+#[test]
+fn test_snapshot_retention_prunes_oldest_periods() {
+    let (env, contract_id) = setup();
+    let sub_id = 7;
+
+    env.as_contract(&contract_id, || {
+        for period_index in 0..=MAX_BILLING_PERIOD_SNAPSHOTS_PER_SUBSCRIPTION {
+            let snapshot = BillingPeriodSnapshot {
+                subscription_id: sub_id,
+                period_index: u64::from(period_index),
+                period_start: u64::from(period_index) * 100,
+                period_end: u64::from(period_index) * 100 + 50,
+                total_charged: 500,
+                total_usage_units: 0,
+                status_flags: SNAPSHOT_FLAG_INTERVAL_CHARGED | SNAPSHOT_FLAG_CLOSED,
+                finalized_at: u64::from(period_index) * 100 + 50,
+            };
+            assert!(write_period_snapshot(&env, snapshot).is_ok());
+        }
+
+        assert!(get_period_snapshot(&env, sub_id, 0).is_none());
+
+        let index: soroban_sdk::Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::BillingPeriodSnapshotIndex(sub_id))
+            .unwrap();
+        assert_eq!(index.len(), MAX_BILLING_PERIOD_SNAPSHOTS_PER_SUBSCRIPTION);
+
+        let retained = list_period_snapshots(
+            &env,
+            sub_id,
+            MAX_BILLING_PERIOD_SNAPSHOTS_PER_SUBSCRIPTION,
+        );
+        assert_eq!(retained.len(), MAX_BILLING_PERIOD_SNAPSHOTS_PER_SUBSCRIPTION);
+        assert_eq!(
+            retained.get(0).unwrap().period_index,
+            u64::from(MAX_BILLING_PERIOD_SNAPSHOTS_PER_SUBSCRIPTION)
+        );
+        assert_eq!(retained.get(retained.len() - 1).unwrap().period_index, 1);
     });
 }
 

@@ -17,9 +17,10 @@ Failed charges do not create snapshots.
 
 Retention strategy:
 
-- snapshots are immutable once written
-- old snapshots can be pruned or compacted by off-chain indexers after export
-- period index ordering preserves historical continuity even if old records are archived
+- The contract retains at most the 365 most recently written snapshots per subscription.
+- When a new period snapshot exceeds this limit, the oldest snapshot and its index entry are deleted.
+- The existing persistent-storage TTL remains a fallback for snapshots and indices that are no longer accessed.
+- Indexers that need a complete audit history should export snapshots before they are evicted; period indices preserve ordering across the retained window.
 
 ## Integrity Verification
 
