@@ -34,7 +34,6 @@ Thumbs.db
 
 # IDE / Editor
 .idea/
-.vscode/
 *.swp
 *.swo
 *~
@@ -67,3 +66,7 @@ tarpaulin-report.html
 test_snapshots/
 **/test_snapshots/
 .coverage
+branch_structure.json
+temp_auto_push.bat
+temp_interactive_push.bat
+.gitignore
