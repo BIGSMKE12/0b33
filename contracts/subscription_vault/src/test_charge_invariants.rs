@@ -444,6 +444,58 @@ proptest! {
         );
         prop_assert!(sub.check_conservation());
     }
+
+    /// Exact-balance charge: when prepaid_balance equals the charge amount,
+    /// the charge succeeds, prepaid_balance becomes exactly zero, and status
+    /// transitions to InsufficientBalance for subsequent charge attempts.
+    #[test]
+    fn test_charge_exact_balance_transitions_to_insufficient() {
+        let interval = 3600u64;
+        let amount = 1000i128;
+        
+        let mut sub = ChargeModel::new(interval, amount);
+        sub.deposit(amount);
+        
+        // Before charge: balance equals amount
+        assert_eq!(sub.prepaid_balance, amount, "initial balance should equal charge amount");
+        assert_eq!(sub.status, SubStatus::Active, "status should be Active initially");
+        
+        // Execute charge
+        let charge_time = interval;
+        let success = sub.charge(charge_time);
+        
+        // After charge: balance is exactly zero
+        assert!(success, "exact-balance charge should succeed");
+        assert_eq!(
+            sub.prepaid_balance, 0,
+            "prepaid_balance should be exactly zero after exact-balance charge"
+        );
+        assert_eq!(
+            sub.total_charged, amount,
+            "total_charged should equal the charge amount"
+        );
+        assert_eq!(
+            sub.status,
+            SubStatus::Active,
+            "status should remain Active after successful charge"
+        );
+        assert!(sub.check_conservation(), "fund conservation should hold");
+        
+        // Subsequent charge attempt with zero balance should fail and transition to InsufficientBalance
+        let second_charge_time = charge_time.saturating_add(interval);
+        let second_success = sub.charge(second_charge_time);
+        
+        assert!(!second_success, "charge with zero balance should fail");
+        assert_eq!(
+            sub.status,
+            SubStatus::InsufficientBalance,
+            "status should transition to InsufficientBalance when balance is insufficient"
+        );
+        assert_eq!(
+            sub.prepaid_balance, 0,
+            "prepaid_balance should remain zero"
+        );
+    }
 }
 
 #[test]
