@@ -4,7 +4,8 @@ use crate::{
     ChargeExecutionResult, DISPUTE_WINDOW_SECS, DataKey, Dispute, DisputeOpenedEvent,
     DisputeRespondedEvent, DisputeResolvedEvent, DisputeStatus, Error, MerchantWithdrawalEvent,
     OraclePrice, RecoveryReason, Subscription, SubscriptionStatus, SubscriptionVault,
-    SubscriptionVaultClient, MAX_SUBSCRIPTION_ID, MAX_SUBSCRIPTION_LIST_PAGE,
+    SubscriptionVaultClient, MAX_SUBSCRIPTION_AMOUNT, MAX_SUBSCRIPTION_ID,
+    MAX_SUBSCRIPTION_LIST_PAGE,
 };
 use soroban_sdk::testutils::{Address as _, Events, Ledger as _};
 use soroban_sdk::{
@@ -5864,16 +5865,34 @@ fn test_create_subscription_max_amount_and_cap_succeeds() {
     let id = test_env.client.create_subscription(
         &subscriber,
         &merchant,
-        &i128::MAX,
+        &MAX_SUBSCRIPTION_AMOUNT,
         &INTERVAL,
         &false,
-        &Some(i128::MAX),
+        &Some(MAX_SUBSCRIPTION_AMOUNT),
         &None::<u64>,
     &None::<u32>,
     );
     let sub = test_env.client.get_subscription(&id);
-    assert_eq!(sub.amount, i128::MAX);
-    assert_eq!(sub.lifetime_cap, Some(i128::MAX));
+    assert_eq!(sub.amount, MAX_SUBSCRIPTION_AMOUNT);
+    assert_eq!(sub.lifetime_cap, Some(MAX_SUBSCRIPTION_AMOUNT));
+}
+
+#[test]
+fn test_create_subscription_i128_max_amount_rejected() {
+    let test_env = TestEnv::default();
+    let subscriber = Address::generate(&test_env.env);
+    let merchant = Address::generate(&test_env.env);
+    let result = test_env.client.try_create_subscription(
+        &subscriber,
+        &merchant,
+        &i128::MAX,
+        &INTERVAL,
+        &false,
+        &None::<i128>,
+        &None::<u64>,
+        &None::<u32>,
+    );
+    assert_eq!(result, Err(Ok(Error::InvalidAmount)));
 }
 
 #[test]
@@ -5884,14 +5903,28 @@ fn test_create_subscription_max_amount_cap_smaller_rejected() {
     let result = test_env.client.try_create_subscription(
         &subscriber,
         &merchant,
-        &i128::MAX,
+        &MAX_SUBSCRIPTION_AMOUNT,
         &INTERVAL,
         &false,
-        &Some(i128::MAX - 1),
+        &Some(MAX_SUBSCRIPTION_AMOUNT - 1),
         &None::<u64>,
     &None::<u32>,
     );
     assert_eq!(result, Err(Ok(Error::InvalidInput)));
+}
+
+#[test]
+fn test_plan_template_i128_max_amount_rejected() {
+    let test_env = TestEnv::default();
+    let merchant = Address::generate(&test_env.env);
+    let result = test_env.client.try_create_plan_template(
+        &merchant,
+        &i128::MAX,
+        &INTERVAL,
+        &false,
+        &None::<i128>,
+    );
+    assert_eq!(result, Err(Ok(Error::InvalidAmount)));
 }
 
 // =============================================================================
