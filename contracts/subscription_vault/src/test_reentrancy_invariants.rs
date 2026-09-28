@@ -732,3 +732,104 @@ fn test_charge_failure_then_topup_then_charge_succeeds() {
         PREPAID - AMOUNT
     );
 }
+
+// =============================================================================
+// 9. PANICKED PATH — reentrancy lock release on panic/transaction revert
+// =============================================================================
+
+/// Invariant: if a transaction panics after acquiring the reentrancy lock but
+/// before releasing it, Soroban unwinds the transaction and all storage changes
+/// (including the lock) are reverted. Subsequent calls must not fail with
+/// Reentrancy error.
+///
+/// This test verifies that a failed (panicking) transaction does not permanently
+/// set the reentrancy lock, ensuring the lock lifecycle is clean even on panic paths.
+#[test]
+fn test_reentrancy_lock_released_on_panic_transaction_revert() {
+    let (env, client, token, _) = setup();
+    let (id, subscriber, _) = create_sub(&env, &client, &token);
+
+    // Attempt an operation that will fail/panic — deposit with 0 amount is invalid
+    let result = client.try_deposit_funds(&id, &0i128, &None::<soroban_sdk::BytesN<32>>);
+    assert!(result.is_err(), "deposit with 0 amount should fail");
+
+    // Verify that the reentrancy lock was not left in a stuck state
+    // A subsequent valid deposit must succeed without Reentrancy error
+    let valid_result = client.try_deposit_funds(&id, &5_000_000i128, &None::<soroban_sdk::BytesN<32>>);
+    assert!(
+        valid_result.is_ok(),
+        "valid deposit after failed transaction must succeed — lock must be released on panic"
+    );
+    assert_eq!(client.get_subscription(&id).prepaid_balance, 5_000_000i128);
+}
+
+/// Invariant: charge on non-existent subscription fails cleanly, and the
+/// reentrancy lock is not left stuck. A subsequent valid charge on a different
+/// subscription must succeed.
+#[test]
+fn test_reentrancy_lock_released_after_charge_on_nonexistent_subscription() {
+    let (env, client, token, _) = setup();
+    let (valid_id, _, _) = create_sub(&env, &client, &token);
+    
+    seed_balance(&env, &client, valid_id, PREPAID);
+    soroban_sdk::token::StellarAssetClient::new(&env, &token)
+        .mint(&client.address, &PREPAID);
+
+    // Attempt charge on non-existent subscription
+    env.ledger().set_timestamp(T0 + INTERVAL + 1);
+    let result = client.try_charge_subscription(&9999u32, &None::<soroban_sdk::BytesN<32>>);
+    assert_eq!(result, Err(Ok(Error::NotFound)));
+
+    // Valid charge on existing subscription must succeed (lock not stuck)
+    let valid_result = client.try_charge_subscription(&valid_id, &None::<soroban_sdk::BytesN<32>>);
+    assert!(
+        valid_result.is_ok(),
+        "valid charge after failed charge must succeed — lock must be released"
+    );
+}
+
+/// Invariant: refund that exceeds balance fails, but does not leave reentrancy
+/// lock stuck. A subsequent valid refund must succeed.
+#[test]
+fn test_reentrancy_lock_released_after_failed_refund_exceeds_balance() {
+    let (env, client, token, admin) = setup();
+    let (id, subscriber, _) = create_sub(&env, &client, &token);
+
+    let deposit = 3_000_000i128;
+    client.deposit_funds(&id, &deposit, &None::<soroban_sdk::BytesN<32>>);
+
+    // Attempt refund exceeding balance
+    let result = client.try_partial_refund(&admin, &id, &subscriber, &(deposit + 1));
+    assert_eq!(result, Err(Ok(Error::InsufficientBalance)));
+
+    // Valid refund within balance must succeed
+    let valid_result = client.try_partial_refund(&admin, &id, &subscriber, &1_000_000i128);
+    assert!(
+        valid_result.is_ok(),
+        "valid refund after failed refund must succeed — lock must be released"
+    );
+    assert_eq!(client.get_subscription(&id).prepaid_balance, deposit - 1_000_000i128);
+}
+
+/// Invariant: withdrawal attempt on active (non-cancelled) subscription fails,
+/// but lock is released. A subsequent cancellation + withdrawal must succeed.
+#[test]
+fn test_reentrancy_lock_released_after_failed_withdrawal_not_cancelled() {
+    let (env, client, token, _) = setup();
+    let (id, subscriber, _) = create_sub(&env, &client, &token);
+
+    client.deposit_funds(&id, &PREPAID, &None::<soroban_sdk::BytesN<32>>);
+
+    // Attempt withdrawal on active subscription (not cancelled)
+    let result = client.try_withdraw_subscriber_funds(&id, &subscriber);
+    assert!(result.is_err(), "withdrawal on active subscription should fail");
+
+    // Cancel subscription and retry withdrawal
+    client.cancel_subscription(&id, &subscriber);
+    let valid_result = client.try_withdraw_subscriber_funds(&id, &subscriber);
+    assert!(
+        valid_result.is_ok(),
+        "withdrawal after cancellation must succeed — lock must be released"
+    );
+    assert_eq!(client.get_subscription(&id).prepaid_balance, 0);
+}
